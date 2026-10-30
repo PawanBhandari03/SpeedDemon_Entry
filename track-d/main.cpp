@@ -137,12 +137,16 @@ struct Searcher {
 
     const uint32_t* off;
     const Arc* arcs;
-    std::vector<D> dist;
+    // Stored as distance + 1, so 0 means "not reached yet". The array comes from calloc and is
+    // never filled: pages the searches do not reach are never touched and cost no memory.
+    D* dist;
     std::vector<uint32_t> touched;
     RadixHeap radix;
     std::vector<Entry> heap;
 
-    Searcher(const uint32_t* o, const Arc* a, size_t n) : off(o), arcs(a), dist(n, kInf) {}
+    Searcher(const uint32_t* o, const Arc* a, size_t n) : off(o), arcs(a), dist(static_cast<D*>(calloc(n, sizeof(D)))) {}
+    Searcher(const Searcher&) = delete;
+    ~Searcher() { free(dist); }
 
     // Distance from s to t, -1 if unreachable, or kOverflow if D is too small for this search.
     int64_t run(uint32_t s, uint32_t t) {
@@ -153,7 +157,7 @@ struct Searcher {
             else { heap.emplace_back(d, v); std::push_heap(heap.begin(), heap.end(), cmp); }
         };
         int64_t result = -1;
-        dist[s] = 0;
+        dist[s] = 1;
         touched.push_back(s);
         push(0, s);
         while (kNarrow ? radix.size != 0 : !heap.empty()) {
@@ -169,22 +173,23 @@ struct Searcher {
                 u = heap.back().second;
                 heap.pop_back();
             }
-            if (d > dist[u]) continue;  // stale entry
+            if (d + 1 > dist[u]) continue;  // stale entry
             if (u == t) { result = static_cast<int64_t>(d); break; }
             bool overflow = false;
             for (uint32_t i = off[u], e = off[u + 1]; i < e; ++i) {
                 const uint64_t nd = d + arcs[i].w;
                 const uint32_t v = arcs[i].to;
-                if (nd >= kInf) { overflow = true; break; }
-                if (nd < dist[v]) {
-                    if (dist[v] == kInf) touched.push_back(v);
-                    dist[v] = static_cast<D>(nd);
+                if (nd + 1 >= kInf) { overflow = true; break; }
+                const D cur = dist[v];
+                if (cur == 0 || nd + 1 < cur) {
+                    if (cur == 0) touched.push_back(v);
+                    dist[v] = static_cast<D>(nd + 1);
                     push(nd, v);
                 }
             }
             if (overflow) { result = kOverflow; break; }
         }
-        for (uint32_t v : touched) dist[v] = kInf;
+        for (uint32_t v : touched) dist[v] = 0;
         touched.clear();
         radix.clear();
         heap.clear();
@@ -355,6 +360,7 @@ int main(int argc, char** argv) {
             queries.emplace_back(new_id[s], new_id[t]);
         }
     }
+    std::vector<uint32_t>().swap(new_id);  // only the queries needed the renumbering table
 
     std::vector<int64_t> answer(queries.size());
     {
