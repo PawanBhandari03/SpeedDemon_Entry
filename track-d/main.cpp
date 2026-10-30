@@ -69,6 +69,23 @@ int thread_count() {
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
 
+// All threads wait here until every one has arrived. Spinning is cheap: each thread has its own
+// hardware thread, and a level of the search takes microseconds.
+struct SpinBarrier {
+    explicit SpinBarrier(int n) : n(n) {}
+    void wait() {
+        const int g = gen.load(std::memory_order_acquire);
+        if (count.fetch_add(1, std::memory_order_acq_rel) == n - 1) {
+            count.store(0, std::memory_order_relaxed);
+            gen.fetch_add(1, std::memory_order_release);
+        } else {
+            while (gen.load(std::memory_order_acquire) == g) __builtin_ia32_pause();
+        }
+    }
+    const int n;
+    std::atomic<int> count{0}, gen{0};
+};
+
 template <class F>
 void parallel(int n, F&& f) {
     std::vector<std::thread> th;
@@ -208,17 +225,61 @@ int main(int argc, char** argv) {
     // Renumber the nodes in breadth-first order. The input ids are a random shuffle, so a
     // search jumps all over the arrays; after renumbering, nodes that are close on the map
     // are close in memory and a search stays inside a few cache-friendly ranges.
-    std::vector<uint32_t> order;  // new id -> old id
-    order.reserve(n);
-    std::vector<uint32_t> new_id(n, UINT32_MAX);
-    for (uint32_t root = 0; root < n; ++root) {
-        if (new_id[root] != UINT32_MAX) continue;
-        new_id[root] = static_cast<uint32_t>(order.size());
-        order.push_back(root);
-        for (size_t head = order.size() - 1; head < order.size(); ++head)
-            for (uint32_t i = off[order[head]], e = off[order[head] + 1]; i < e; ++i) {
-                const uint32_t v = arcs[i].to;
-                if (new_id[v] == UINT32_MAX) { new_id[v] = static_cast<uint32_t>(order.size()); order.push_back(v); }
+    // The main body is one strongly connected component, so a single search from one of its
+    // nodes covers nearly everything; it runs level by level on all threads. Any visiting order
+    // is correct (it only renames nodes), so the threads need not agree on one.
+    constexpr uint32_t kUnset = UINT32_MAX, kClaimed = UINT32_MAX - 1;
+    std::vector<uint32_t> order(n);  // new id -> old id
+    std::vector<uint32_t> new_id(n, kUnset);
+    size_t filled = 0;
+    uint32_t root = 0;
+    while (root < n && (off[root + 1] == off[root] || !has_in[root])) ++root;
+    if (root < n) {
+        order[0] = root;
+        new_id[root] = 0;
+        std::vector<std::vector<uint32_t>> found(nt);
+        std::vector<size_t> base(nt + 1);
+        size_t lo = 0, hi = 1;  // the current level is order[lo, hi)
+        SpinBarrier bar(nt);
+        parallel(nt, [&](int i) {
+            auto& mine = found[i];
+            while (lo < hi) {
+                for (size_t x = lo + (hi - lo) * i / nt, b = lo + (hi - lo) * (i + 1) / nt; x < b; ++x)
+                    for (uint32_t j = off[order[x]], e = off[order[x] + 1]; j < e; ++j) {
+                        std::atomic_ref<uint32_t> id(new_id[arcs[j].to]);
+                        uint32_t unset = kUnset;
+                        if (id.load(std::memory_order_relaxed) == kUnset &&
+                            id.compare_exchange_strong(unset, kClaimed, std::memory_order_relaxed))
+                            mine.push_back(arcs[j].to);
+                    }
+                bar.wait();
+                if (i == 0) {
+                    base[0] = hi;
+                    for (int t = 0; t < nt; ++t) base[t + 1] = base[t] + found[t].size();
+                }
+                bar.wait();
+                for (size_t j = 0; j < mine.size(); ++j) {
+                    order[base[i] + j] = mine[j];
+                    new_id[mine[j]] = static_cast<uint32_t>(base[i] + j);
+                }
+                mine.clear();
+                bar.wait();
+                if (i == 0) { lo = hi; hi = base[nt]; }
+                bar.wait();
+            }
+        });
+        filled = hi;
+    }
+    // What the root cannot reach (islands, isolated nodes, nodes with no in-edge) follows, one
+    // small search at a time.
+    for (uint32_t r = 0; r < n; ++r) {
+        if (new_id[r] != kUnset) continue;
+        new_id[r] = static_cast<uint32_t>(filled);
+        order[filled++] = r;
+        for (size_t head = filled - 1; head < filled; ++head)
+            for (uint32_t j = off[order[head]], e = off[order[head] + 1]; j < e; ++j) {
+                const uint32_t v = arcs[j].to;
+                if (new_id[v] == kUnset) { new_id[v] = static_cast<uint32_t>(filled); order[filled++] = v; }
             }
     }
     {
