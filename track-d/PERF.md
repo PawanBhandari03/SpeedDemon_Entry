@@ -4,5 +4,5 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 72.69 | 893 | 0 |
-| 1 | | | | | |
+| 0 | The reference, unchanged | | 72.69 | | 0 |
+| 1 | C++ rewrite: parallel parse, CSR graph, Dijkstra per query with early stop, queries in parallel. Local hash check passes on sample and full. | | | | |
