@@ -160,10 +160,13 @@ struct Dict {
 };
 
 struct Worker {
-    std::vector<uint64_t> records;  // (term << 32) | doc, one per occurrence of a rare term, in file order
+    std::vector<uint32_t> terms;    // rare terms, once per document, in document order
+    std::vector<uint32_t> doc_end;  // per document of this worker: end of its run in terms
+    uint32_t first_doc = 0;
+    std::vector<uint64_t> occ;      // (term << 32) | doc for every occurrence of a phrase-driver term
     std::vector<uint32_t> offs;     // file offset of each of those occurrences
-    std::vector<uint32_t> count;    // occurrences per term seen by this worker
-    std::vector<uint32_t> last;     // last document seen for each dense term, to set its bit once
+    std::vector<uint32_t> count;    // list entries per term seen by this worker
+    std::vector<uint32_t> last;     // last document seen for each term, to record a document once
 };
 
 struct TermSet {
@@ -303,13 +306,23 @@ int main(int argc, char** argv) {
     uint64_t sample_docs = 0;
     for (uint32_t s : sampled) sample_docs += s;
     std::vector<int32_t> dense_of(Q, -1);
+    std::vector<uint64_t> est(Q, 0);  // sampled document count per term
     uint32_t dense_count = 0;
     for (uint32_t t = 0; t < Q; ++t) {
-        uint64_t seen = 0;
-        for (auto& w : workers) seen += w.count[t];
-        if (sample_docs && seen * N > uint64_t(kDenseDf) * sample_docs) dense_of[t] = static_cast<int32_t>(dense_count++);
+        for (auto& w : workers) est[t] += w.count[t];
+        if (sample_docs && est[t] * N > uint64_t(kDenseDf) * sample_docs) dense_of[t] = static_cast<int32_t>(dense_count++);
     }
     std::vector<uint64_t> dense_bits(static_cast<size_t>(dense_count) * W, 0);
+    // The rarest-looking term of each phrase will drive its check, which needs every occurrence
+    // and its offset. Every other rare term only needs its list of documents.
+    std::vector<uint8_t> positional(Q, 0);
+    for (const Query& q : queries) {
+        if (!q.phrase) continue;
+        uint32_t best = qid[q.first];
+        for (uint32_t k = 1; k < q.count; ++k)
+            if (est[qid[q.first + k]] < est[best]) best = qid[q.first + k];
+        if (dense_of[best] < 0) positional[best] = 1;
+    }
 
     // ---- Pass 1: find the query terms in every document.
     parallel(nt, [&](int i) {
@@ -318,58 +331,71 @@ int main(int argc, char** argv) {
         std::fill(w.last.begin(), w.last.end(), UINT32_MAX);
         const char* p = cut[i];
         const char* const e = std::max(cut[i], cut[i + 1]);
-        w.records.reserve(static_cast<size_t>(e - p) / 40 + 16);
-        w.offs.reserve(static_cast<size_t>(e - p) / 40 + 16);
+        w.terms.reserve(static_cast<size_t>(e - p) / 64 + 16);
+        bool first = true;
         while (p < e) {
             uint32_t doc = 0;
             for (const char* x = p; *x != '\t'; ++x) doc = doc * 10 + static_cast<uint32_t>(*x - '0');
+            if (first) { w.first_doc = doc; first = false; }
             doc_off[doc] = static_cast<uint32_t>(p - dbase);
             p = tokenize_line(p, dend, [&](uint64_t key, const char* at) {
                 const uint32_t t = dict.find(key);
                 if (t == UINT32_MAX) return;
-                if (dense_of[t] >= 0) {
-                    if (w.last[t] != doc) {
-                        w.last[t] = doc;
-                        dense_bits[static_cast<size_t>(dense_of[t]) * W + (doc >> 6)] |= 1ull << (doc & 63);
-                    }
+                if (positional[t]) {
+                    ++w.count[t];
+                    w.occ.push_back((static_cast<uint64_t>(t) << 32) | doc);
+                    w.offs.push_back(static_cast<uint32_t>(at - dbase));
                     return;
                 }
-                // A rare term keeps every occurrence with its offset, so a phrase check can start
-                // right at it instead of re-reading the whole document.
-                ++w.count[t];
-                w.records.push_back((static_cast<uint64_t>(t) << 32) | doc);
-                w.offs.push_back(static_cast<uint32_t>(at - dbase));
+                if (w.last[t] == doc) return;
+                w.last[t] = doc;
+                if (dense_of[t] >= 0) {
+                    dense_bits[static_cast<size_t>(dense_of[t]) * W + (doc >> 6)] |= 1ull << (doc & 63);
+                } else {
+                    ++w.count[t];
+                    w.terms.push_back(t);
+                }
             });
+            w.doc_end.push_back(static_cast<uint32_t>(w.terms.size()));
         }
     });
 
-    // ---- Posting lists of the other terms: every worker's records go to their term's slice,
+    // ---- Posting lists of the rare terms. The phrase-driver terms come first, so their offsets
+    // fit in one array of exactly their size. Each worker's entries go to their term's slice,
     // already in document order.
     std::vector<uint32_t> start(Q + 1, 0);
-    for (uint32_t t = 0; t < Q; ++t) {
-        uint32_t run = start[t];
-        for (int i = 0; i < nt; ++i) {
-            const uint32_t c = workers[i].count[t];
-            workers[i].count[t] = run;  // becomes this worker's write cursor for the term
-            run += c;
+    uint32_t run = 0, positional_total = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (uint32_t t = 0; t < Q; ++t) {
+            if (positional[t] != (pass == 0)) continue;
+            start[t] = run;
+            for (int i = 0; i < nt; ++i) {
+                const uint32_t c = workers[i].count[t];
+                workers[i].count[t] = run;  // becomes this worker's write cursor for the term
+                run += c;
+            }
         }
-        start[t + 1] = run;
+        if (pass == 0) positional_total = run;
     }
-    std::vector<uint32_t> postings(start[Q]), post_off(start[Q]);
+    std::vector<uint32_t> postings(run), post_off(positional_total), df(Q);
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
-        for (size_t j = 0; j < w.records.size(); ++j) {
-            const uint32_t at = w.count[w.records[j] >> 32]++;
-            postings[at] = static_cast<uint32_t>(w.records[j]);
+        for (size_t k = 0, r = 0; k < w.doc_end.size(); ++k)
+            for (; r < w.doc_end[k]; ++r) postings[w.count[w.terms[r]]++] = w.first_doc + static_cast<uint32_t>(k);
+        for (size_t j = 0; j < w.occ.size(); ++j) {
+            const uint32_t at = w.count[w.occ[j] >> 32]++;
+            postings[at] = static_cast<uint32_t>(w.occ[j]);
             post_off[at] = w.offs[j];
         }
-        std::vector<uint64_t>().swap(w.records);
+        std::vector<uint32_t>().swap(w.terms);
+        std::vector<uint32_t>().swap(w.doc_end);
+        std::vector<uint64_t>().swap(w.occ);
         std::vector<uint32_t>().swap(w.offs);
     });
-    std::vector<uint32_t> df(Q);
+    // After the scatter the last worker's cursor of a term is the end of the term's slice.
     parallel(nt, [&](int i) {
         for (uint32_t t = Q * uint64_t(i) / nt; t < Q * uint64_t(i + 1) / nt; ++t) {
-            if (dense_of[t] < 0) { df[t] = start[t + 1] - start[t]; continue; }
+            if (dense_of[t] < 0) { df[t] = workers[nt - 1].count[t] - start[t]; continue; }
             const uint64_t* b = dense_bits.data() + static_cast<size_t>(dense_of[t]) * W;
             uint32_t c = 0;
             for (size_t k = 0; k < W; ++k) c += static_cast<uint32_t>(__builtin_popcountll(b[k]));
@@ -440,9 +466,16 @@ int main(int argc, char** argv) {
                                 for (uint64_t bits = R[w]; bits; bits &= bits - 1) take(static_cast<uint32_t>(w * 64 + static_cast<unsigned>(__builtin_ctzll(bits))));
                         } else {
                             // Documents holding every term, driven by the rarest term, then an exact check of each.
-                            uint32_t drv = ids[0];
-                            for (uint32_t k = 1; k < q.count; ++k)
-                                if (df[ids[k]] < df[drv]) drv = ids[k];
+                            // The driver is the phrase's rarest term that kept its occurrences; when
+                            // every term is common there is none, and the rarest term's bitset drives.
+                            uint32_t drv = UINT32_MAX;
+                            for (uint32_t k = 0; k < q.count; ++k)
+                                if (positional[ids[k]] && (drv == UINT32_MAX || df[ids[k]] < df[drv])) drv = ids[k];
+                            if (drv == UINT32_MAX) {
+                                drv = ids[0];
+                                for (uint32_t k = 1; k < q.count; ++k)
+                                    if (df[ids[k]] < df[drv]) drv = ids[k];
+                            }
                             const TermSet sd = term_set(drv);
                             const uint32_t k = q.count;
                             uint64_t want[8];
