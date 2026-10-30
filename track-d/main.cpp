@@ -94,58 +94,99 @@ void parallel(int n, F&& f) {
     for (auto& t : th) t.join();
 }
 
-// Dijkstra with a binary heap on a reusable distance array of type D (uint32_t or uint64_t).
-// With 32-bit distances a heap entry is (distance << 32 | node) in one integer, so a
-// comparison is one integer compare.
+// Monotone priority queue for 32-bit keys (a radix heap). An entry (key << 32 | node) sits in
+// the bucket of the highest bit in which its key differs from the last key popped; Dijkstra
+// never pushes a key below that, so only the lowest non-empty bucket is ever redistributed.
+struct RadixHeap {
+    std::vector<uint64_t> b[33];
+    uint32_t last = 0;
+    size_t size = 0;
+
+    static int bucket(uint32_t k, uint32_t last) { return k == last ? 0 : 32 - __builtin_clz(k ^ last); }
+    void push(uint64_t e) {
+        b[bucket(static_cast<uint32_t>(e >> 32), last)].push_back(e);
+        ++size;
+    }
+    uint64_t pop() {
+        if (b[0].empty()) {
+            int i = 1;
+            while (b[i].empty()) ++i;
+            last = static_cast<uint32_t>(*std::min_element(b[i].begin(), b[i].end()) >> 32);
+            for (uint64_t e : b[i]) b[bucket(static_cast<uint32_t>(e >> 32), last)].push_back(e);
+            b[i].clear();
+        }
+        --size;
+        const uint64_t e = b[0].back();
+        b[0].pop_back();
+        return e;
+    }
+    void clear() {
+        for (auto& v : b) v.clear();
+        last = 0;
+        size = 0;
+    }
+};
+
+// Dijkstra on a reusable distance array of type D (uint32_t or uint64_t). With 32-bit distances
+// the queue is a radix heap; the rare 64-bit search uses a binary heap of (distance, node).
 template <class D>
 struct Searcher {
     static constexpr D kInf = std::numeric_limits<D>::max();
-    using Entry = std::conditional_t<sizeof(D) == 4, uint64_t, std::pair<uint64_t, uint32_t>>;
+    static constexpr bool kNarrow = sizeof(D) == 4;
+    using Entry = std::pair<uint64_t, uint32_t>;
 
     const uint32_t* off;
     const Arc* arcs;
     std::vector<D> dist;
     std::vector<uint32_t> touched;
+    RadixHeap radix;
     std::vector<Entry> heap;
 
     Searcher(const uint32_t* o, const Arc* a, size_t n) : off(o), arcs(a), dist(n, kInf) {}
-
-    static Entry entry(uint64_t d, uint32_t v) {
-        if constexpr (sizeof(D) == 4) return d << 32 | v;
-        else return {d, v};
-    }
 
     // Distance from s to t, -1 if unreachable, or kOverflow if D is too small for this search.
     int64_t run(uint32_t s, uint32_t t) {
         if (s == t) return 0;
         const auto cmp = std::greater<Entry>();
+        auto push = [&](uint64_t d, uint32_t v) {
+            if constexpr (kNarrow) radix.push(d << 32 | v);
+            else { heap.emplace_back(d, v); std::push_heap(heap.begin(), heap.end(), cmp); }
+        };
         int64_t result = -1;
         dist[s] = 0;
         touched.push_back(s);
-        heap.push_back(entry(0, s));
-        while (!heap.empty()) {
-            std::pop_heap(heap.begin(), heap.end(), cmp);
+        push(0, s);
+        while (kNarrow ? radix.size != 0 : !heap.empty()) {
             uint64_t d;
             uint32_t u;
-            if constexpr (sizeof(D) == 4) { d = heap.back() >> 32; u = static_cast<uint32_t>(heap.back()); }
-            else { d = heap.back().first; u = heap.back().second; }
-            heap.pop_back();
+            if constexpr (kNarrow) {
+                const uint64_t e = radix.pop();
+                d = e >> 32;
+                u = static_cast<uint32_t>(e);
+            } else {
+                std::pop_heap(heap.begin(), heap.end(), cmp);
+                d = heap.back().first;
+                u = heap.back().second;
+                heap.pop_back();
+            }
             if (d > dist[u]) continue;  // stale entry
             if (u == t) { result = static_cast<int64_t>(d); break; }
+            bool overflow = false;
             for (uint32_t i = off[u], e = off[u + 1]; i < e; ++i) {
                 const uint64_t nd = d + arcs[i].w;
                 const uint32_t v = arcs[i].to;
-                if (nd >= kInf) { result = kOverflow; heap.clear(); break; }
+                if (nd >= kInf) { overflow = true; break; }
                 if (nd < dist[v]) {
                     if (dist[v] == kInf) touched.push_back(v);
                     dist[v] = static_cast<D>(nd);
-                    heap.push_back(entry(nd, v));
-                    std::push_heap(heap.begin(), heap.end(), cmp);
+                    push(nd, v);
                 }
             }
+            if (overflow) { result = kOverflow; break; }
         }
         for (uint32_t v : touched) dist[v] = kInf;
         touched.clear();
+        radix.clear();
         heap.clear();
         return result;
     }
