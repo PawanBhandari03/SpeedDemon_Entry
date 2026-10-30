@@ -47,7 +47,7 @@ Mapped map_file(const std::string& path) {
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size == 0) { close(fd); return m; }
     m.n = static_cast<size_t>(st.st_size);
-    void* p = mmap(nullptr, m.n, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    void* p = mmap(nullptr, m.n, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (p == MAP_FAILED) { m.n = 0; return m; }
     m.p = static_cast<const char*>(p);

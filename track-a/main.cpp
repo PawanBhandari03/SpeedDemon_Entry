@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
     if (!f) return 1;
     if (size == 0) { fclose(f); return 0; }
 
-    const char* base = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
+    const char* base = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
     if (base == MAP_FAILED) return 1;
     const int64_t base_hour = days_from_civil(2026, 10, 30) * 24 + 18;
 
