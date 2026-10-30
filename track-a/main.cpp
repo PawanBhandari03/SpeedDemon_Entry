@@ -282,10 +282,15 @@ int main(int argc, char** argv) {
             if (!n) continue;
             uint32_t* v = lats.data() + start[g];
             const size_t r99 = (99 * n + 99) / 100, r95 = (95 * n + 99) / 100, r50 = (50 * n + 99) / 100;
-            // Each selection leaves the smaller ranks in front, so the next one searches less.
-            std::nth_element(v, v + r99 - 1, v + n);
-            std::nth_element(v, v + r95 - 1, v + r99);
-            std::nth_element(v, v + r50 - 1, v + r95);
+            if (n <= 64) {
+                // Most buckets are small: a plain sort of a few values beats three selections.
+                std::sort(v, v + n);
+            } else {
+                // Each selection leaves the smaller ranks in front, so the next one searches less.
+                std::nth_element(v, v + r99 - 1, v + n);
+                std::nth_element(v, v + r95 - 1, v + r99);
+                std::nth_element(v, v + r50 - 1, v + r95);
+            }
             char* p = line;
             memcpy(p, hourstr[g / E], 13); p += 13;  // YYYY-MM-DDTHH
             memcpy(p, ":00:00Z ", 8); p += 8;
