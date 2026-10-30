@@ -61,22 +61,41 @@ void parallel(int n, F&& f) {
     for (auto& t : th) t.join();
 }
 
-// Token bytes: a-z and 0-9 map to themselves, A-Z fold to lower case, everything else is a separator (0).
-uint8_t g_class[256];
+// Byte kinds: 1 for token bytes (a-z, A-Z, 0-9), 2 for LF, 0 for every other byte (a separator).
+uint8_t g_kind[256];
+uint8_t g_class[256];  // token bytes only: nonzero for a-z, A-Z, 0-9 (used when walking backwards)
 
 void init_class() {
     for (int c = 0; c < 256; ++c) {
-        if (c >= 'a' && c <= 'z') g_class[c] = static_cast<uint8_t>(c);
-        else if (c >= 'A' && c <= 'Z') g_class[c] = static_cast<uint8_t>(c + 32);
-        else if (c >= '0' && c <= '9') g_class[c] = static_cast<uint8_t>(c);
+        const bool tok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        g_kind[c] = tok ? 1 : (c == '\n' ? 2 : 0);
+        g_class[c] = tok ? 1 : 0;
     }
 }
 
-constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ull;
-constexpr uint64_t kFnvPrime = 0x100000001b3ull;
+inline uint64_t load8(const char* p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    return w;
+}
 
-inline uint64_t finish_key(uint64_t h, uint32_t len) {
-    h ^= static_cast<uint64_t>(len) * 0x9E3779B97F4A7C15ull;
+// Key of the n token bytes at s (a-z, A-Z or 0-9; A-Z count as lower case, since OR 0x20 maps
+// A-Z to a-z and leaves digits and a-z alone). Eight bytes are hashed at a time instead of one,
+// and `limit` is the end of the buffer, so the last token never reads past it.
+inline uint64_t token_key(const char* s, size_t n, const char* limit) {
+    constexpr uint64_t kFold = 0x2020202020202020ull;
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ (n * 0xff51afd7ed558ccdull);
+    while (n > 8) {
+        h = (h ^ (load8(s) | kFold)) * 0xc4ceb9fe1a85ec53ull;
+        h ^= h >> 32;
+        s += 8;
+        n -= 8;
+    }
+    const uint64_t mask = n == 8 ? ~0ull : (1ull << (n * 8)) - 1;
+    uint64_t w = 0;
+    if (s + 8 <= limit) w = load8(s);
+    else memcpy(&w, s, n);
+    h = (h ^ ((w | kFold) & mask)) * 0xff51afd7ed558ccdull;
     h ^= h >> 29;
     h *= 0xbf58476d1ce4e5b9ull;
     h ^= h >> 32;
@@ -85,29 +104,24 @@ inline uint64_t finish_key(uint64_t h, uint32_t len) {
 
 // Calls f(key, start) for every token of one document line starting at p (the id, a TAB, then
 // the text); start points at the token's first byte. Returns a pointer just past the line's LF.
+// Every line ends with an LF, so the loops need no end check.
 template <class F>
 inline const char* tokenize_line(const char* p, const char* end, F&& f) {
-    while (p < end && *p != '\t') ++p;
+    while (*p != '\t') ++p;
     ++p;
-    uint64_t h = kFnvBasis;
-    uint32_t len = 0;
-    for (; p < end; ++p) {
-        const uint8_t c = g_class[static_cast<uint8_t>(*p)];
-        if (c) {
-            h = (h ^ c) * kFnvPrime;
-            ++len;
-        } else {
-            if (len) { f(finish_key(h, len), p - len); h = kFnvBasis; len = 0; }
-            if (*p == '\n') return p + 1;
-        }
+    for (;;) {
+        uint8_t k;
+        while ((k = g_kind[static_cast<uint8_t>(*p)]) == 0) ++p;  // separators
+        if (k == 2) return p + 1;
+        const char* s = p;
+        while (g_kind[static_cast<uint8_t>(*++p)] == 1) {}
+        f(token_key(s, static_cast<size_t>(p - s), end), s);
     }
-    if (len) f(finish_key(h, len), p - len);
-    return end;
 }
 
 // True when the k keys in want are k consecutive tokens of the text [begin, ...) and the m-th
 // of them starts at `at`: walks back m tokens from `at`, then hashes k tokens forward.
-inline bool window_match(const char* begin, const char* at, const uint64_t* want, uint32_t k, uint32_t m) {
+inline bool window_match(const char* begin, const char* at, const char* limit, const uint64_t* want, uint32_t k, uint32_t m) {
     const char* p = at;
     for (uint32_t r = 0; r < m; ++r) {
         const char* q = p - 1;
@@ -121,10 +135,9 @@ inline bool window_match(const char* begin, const char* at, const uint64_t* want
             if (*p == '\n') return false;
             ++p;
         }
-        uint64_t h = kFnvBasis;
-        uint32_t len = 0;
-        for (uint8_t c; (c = g_class[static_cast<uint8_t>(*p)]); ++p, ++len) h = (h ^ c) * kFnvPrime;
-        if (finish_key(h, len) != want[i]) return false;
+        const char* s = p;
+        while (g_class[static_cast<uint8_t>(*p)]) ++p;
+        if (token_key(s, static_cast<size_t>(p - s), limit) != want[i]) return false;
     }
     return true;
 }
@@ -222,11 +235,10 @@ int main(int argc, char** argv) {
                 if (*p == ' ') { ++p; continue; }
                 if (*p == '"') { ++p; continue; }
                 const char* s = p;
-                uint64_t h = kFnvBasis;
-                while (p < e && *p != ' ' && *p != '\n' && *p != '"') { h = (h ^ static_cast<uint8_t>(*p)) * kFnvPrime; ++p; }
+                while (p < e && *p != ' ' && *p != '\n' && *p != '"') ++p;
                 const uint32_t len = static_cast<uint32_t>(p - s);
                 if (q.phrase || want_term) {
-                    qterm.push_back(finish_key(h, len));
+                    qterm.push_back(token_key(s, len, e));
                     qop.push_back(pending);
                     want_term = false;
                 } else {
@@ -324,11 +336,29 @@ int main(int argc, char** argv) {
         if (dense_of[best] < 0) positional[best] = 1;
     }
 
+    // The dense terms are the common words: they make up most corpus tokens. They get their own
+    // tiny table (a few KB, so it stays in the L1 cache) that is checked first, and a per-worker
+    // "last document" array indexed by dense number, so a common token touches only L1-sized data.
+    size_t hot_cap = 16;
+    while (hot_cap < size_t(dense_count) * 2) hot_cap <<= 1;
+    std::vector<uint64_t> hot_keys(hot_cap, 0);
+    std::vector<uint32_t> hot_dense(hot_cap, 0);
+    for (uint32_t t = 0; t < Q; ++t) {
+        if (dense_of[t] < 0) continue;
+        size_t s = keys[t] & (hot_cap - 1);
+        while (hot_keys[s]) s = (s + 1) & (hot_cap - 1);
+        hot_keys[s] = keys[t];
+        hot_dense[s] = static_cast<uint32_t>(dense_of[t]);
+    }
+    const size_t hot_mask = hot_cap - 1;
     // ---- Pass 1: find the query terms in every document.
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
         std::fill(w.count.begin(), w.count.end(), 0);
         std::fill(w.last.begin(), w.last.end(), UINT32_MAX);
+        std::vector<uint32_t> hot_last(dense_count, UINT32_MAX);
+        struct TermState { uint32_t last, count; };  // last document and entries of a rare term, in one cache line
+        std::vector<TermState> st(Q, TermState{UINT32_MAX, 0});
         const char* p = cut[i];
         const char* const e = std::max(cut[i], cut[i + 1]);
         w.terms.reserve(static_cast<size_t>(e - p) / 64 + 16);
@@ -339,25 +369,31 @@ int main(int argc, char** argv) {
             if (first) { w.first_doc = doc; first = false; }
             doc_off[doc] = static_cast<uint32_t>(p - dbase);
             p = tokenize_line(p, dend, [&](uint64_t key, const char* at) {
+                for (size_t s = key & hot_mask; hot_keys[s]; s = (s + 1) & hot_mask) {
+                    if (hot_keys[s] != key) continue;
+                    const uint32_t d = hot_dense[s];
+                    if (hot_last[d] != doc) {
+                        hot_last[d] = doc;
+                        dense_bits[static_cast<size_t>(d) * W + (doc >> 6)] |= 1ull << (doc & 63);
+                    }
+                    return;
+                }
                 const uint32_t t = dict.find(key);
                 if (t == UINT32_MAX) return;
                 if (positional[t]) {
-                    ++w.count[t];
+                    ++st[t].count;
                     w.occ.push_back((static_cast<uint64_t>(t) << 32) | doc);
                     w.offs.push_back(static_cast<uint32_t>(at - dbase));
                     return;
                 }
-                if (w.last[t] == doc) return;
-                w.last[t] = doc;
-                if (dense_of[t] >= 0) {
-                    dense_bits[static_cast<size_t>(dense_of[t]) * W + (doc >> 6)] |= 1ull << (doc & 63);
-                } else {
-                    ++w.count[t];
-                    w.terms.push_back(t);
-                }
+                if (st[t].last == doc) return;
+                st[t].last = doc;
+                ++st[t].count;
+                w.terms.push_back(t);
             });
             w.doc_end.push_back(static_cast<uint32_t>(w.terms.size()));
         }
+        for (uint32_t t = 0; t < Q; ++t) w.count[t] = st[t].count;
     });
 
     // ---- Posting lists of the rare terms. The phrase-driver terms come first, so their offsets
@@ -502,7 +538,7 @@ int main(int argc, char** argv) {
                                     while (*begin != '\t') ++begin;
                                     ++begin;  // the text starts after the TAB
                                     for (uint32_t m = 0; m < k && !cur_found; ++m)
-                                        if (ids[m] == drv) cur_found = window_match(begin, dbase + offs[j], want, k, m);
+                                        if (ids[m] == drv) cur_found = window_match(begin, dbase + offs[j], dend, want, k, m);
                                     if (cur_found) take(d);
                                 }
                             } else {
