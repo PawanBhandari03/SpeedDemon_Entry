@@ -89,11 +89,13 @@ struct EpTable {
     }
 };
 
+// A worker counts its records per (local endpoint, hour) while parsing, so no extra pass over the
+// records is needed. calloc keeps the untouched part of the arrays out of memory.
 struct Worker {
     EpTable table;
     std::vector<Rec> recs;
-    std::vector<uint32_t> cursor;  // per bucket: count, then this worker's write position
-    std::vector<uint32_t> errs;    // per bucket: 5xx count
+    uint32_t* cursor = static_cast<uint32_t*>(calloc(EpTable::kCap * kHours, 4));  // count, then write position
+    uint32_t* errs = static_cast<uint32_t*>(calloc(EpTable::kCap * kHours, 4));    // 5xx count
     std::string out;
     bool bad = false;
 };
@@ -140,7 +142,10 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
         q += 4;
         uint32_t lat = 0;
         while (*q != '\n') lat = lat * 10 + static_cast<uint32_t>(*q++ - '0');
-        w.recs.push_back({w.table.intern(ep, ep_len), static_cast<uint8_t>(rel), err, lat});
+        const uint16_t id = w.table.intern(ep, ep_len);
+        w.recs.push_back({id, static_cast<uint8_t>(rel), err, lat});
+        ++w.cursor[size_t(id) * kHours + static_cast<size_t>(rel)];
+        w.errs[size_t(id) * kHours + static_cast<size_t>(rel)] += err;
         b = q + 1;
     }
 }
@@ -215,41 +220,35 @@ int main(int argc, char** argv) {
     const size_t E = eps.size();
     const size_t G = static_cast<size_t>(kHours) * E;
 
-    // Every worker renames its records to global endpoint ids and counts its records per bucket.
-    parallel(nt, [&](int i) {
-        Worker& w = workers[i];
-        std::vector<uint16_t> remap;
-        for (auto sv : w.table.names) remap.push_back(static_cast<uint16_t>(std::lower_bound(eps.begin(), eps.end(), sv) - eps.begin()));
-        w.cursor.assign(G, 0);
-        w.errs.assign(G, 0);
-        for (Rec& r : w.recs) {
-            r.ep = remap[r.ep];
-            const size_t g = static_cast<size_t>(r.hour) * E + r.ep;
-            ++w.cursor[g];
-            w.errs[g] += r.err;
-        }
-    });
-
-    // Bucket starts, and each worker's write position inside every bucket.
+    // Bucket g = hour * E + global endpoint. Add up the workers' counts per bucket, then turn each
+    // worker's count into its write position inside the bucket (workers in order).
+    std::vector<std::vector<uint32_t>> remap(nt);
+    for (int i = 0; i < nt; ++i)
+        for (auto sv : workers[i].table.names)
+            remap[i].push_back(static_cast<uint32_t>(std::lower_bound(eps.begin(), eps.end(), sv) - eps.begin()));
     std::vector<uint32_t> start(G + 1, 0), errs(G, 0);
-    for (size_t g = 0; g < G; ++g) {
-        uint32_t run = start[g], e = 0;
-        for (auto& w : workers) {
-            const uint32_t c = w.cursor[g];
-            w.cursor[g] = run;
-            run += c;
-            e += w.errs[g];
-        }
-        start[g + 1] = run;
-        errs[g] = e;
-    }
+    for (int i = 0; i < nt; ++i)
+        for (size_t lep = 0; lep < remap[i].size(); ++lep)
+            for (size_t h = 0; h < kHours; ++h) {
+                const size_t g = h * E + remap[i][lep];
+                start[g + 1] += workers[i].cursor[lep * kHours + h];
+                errs[g] += workers[i].errs[lep * kHours + h];
+            }
+    for (size_t g = 0; g < G; ++g) start[g + 1] += start[g];
+    std::vector<uint32_t> running(start.begin(), start.end() - 1);
+    for (int i = 0; i < nt; ++i)
+        for (size_t lep = 0; lep < remap[i].size(); ++lep)
+            for (size_t h = 0; h < kHours; ++h) {
+                uint32_t& c = workers[i].cursor[lep * kHours + h];
+                const uint32_t n = c;
+                c = running[h * E + remap[i][lep]];
+                running[h * E + remap[i][lep]] += n;
+            }
     std::vector<uint32_t> lats(start[G]);
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
-        for (const Rec& r : w.recs) lats[w.cursor[static_cast<size_t>(r.hour) * E + r.ep]++] = r.lat;
+        for (const Rec& r : w.recs) lats[w.cursor[size_t(r.ep) * kHours + r.hour]++] = r.lat;
         std::vector<Rec>().swap(w.recs);
-        std::vector<uint32_t>().swap(w.cursor);
-        std::vector<uint32_t>().swap(w.errs);
     });
 
     char hourstr[kHours][16];
