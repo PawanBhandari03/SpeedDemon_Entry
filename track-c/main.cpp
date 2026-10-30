@@ -108,6 +108,10 @@ struct NameSet {
         if (!(std::atomic_ref<uint64_t>(w).load(std::memory_order_relaxed) & bit))
             std::atomic_ref<uint64_t>(w).fetch_or(bit, std::memory_order_relaxed);
     }
+    void reset(size_t groups) {
+        memset(keys, 0, kCap * sizeof(uint64_t));
+        memset(bits, 0, groups * (kCap / 64) * sizeof(uint64_t));
+    }
     uint64_t distinct(size_t group) const {
         uint64_t c = 0;
         for (size_t w = 0; w < kCap / 64; ++w) c += static_cast<uint64_t>(__builtin_popcountll(bits[group * (kCap / 64) + w]));
@@ -158,8 +162,8 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     *hash = hash_bytes(L.scratch.data(), L.scratch.size());
 }
 
-void parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
-                 uint16_t unmatched, Local& L, NameSet& names) {
+const char* parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
+                        uint16_t unmatched, Local& L, NameSet& names) {
     while (p < stop) {
         if (static_cast<uint8_t>(p[0]) == 0xEF && static_cast<uint8_t>(p[1]) == 0xBB && static_cast<uint8_t>(p[2]) == 0xBF)
             p += 3;  // byte order mark at the start of a record
@@ -194,6 +198,7 @@ void parse_range(const char* p, const char* stop, const char* end, const std::ve
         a.note_bytes += note_len;
         names.add(g, name_hash);
     }
+    return p;
 }
 
 void put_cents(std::string& out, int64_t c) {
@@ -254,25 +259,57 @@ int main(int argc, char** argv) {
         locals.resize(nt);
         for (auto& L : locals) L.agg.assign(groups, Agg());
 
-        // Pass 1: parity of the quote count in every chunk.
         std::vector<const char*> chunk(nt + 1);
         for (int i = 0; i <= nt; ++i) chunk[i] = base + rec.n * static_cast<size_t>(i) / static_cast<size_t>(nt);
-        std::vector<uint8_t> parity(nt, 0);
-        {
+        const char* const hdr = static_cast<const char*>(memchr(base, '\n', rec.n)) + 1;  // skip BOM + header
+
+        // Parses every thread's records from the given first-record starts. Returns true when
+        // each thread stopped exactly where the next one started, i.e. the starts were right.
+        auto parse_all = [&](const std::vector<const char*>& starts) {
+            std::vector<const char*> ends(nt);
             std::vector<std::thread> th;
             for (int i = 0; i < nt; ++i)
                 th.emplace_back([&, i] {
-                    size_t c = 0;
-                    for (const char* x = chunk[i]; x < chunk[i + 1]; ++x) c += (*x == '"');
-                    parity[i] = c & 1;
+                    ends[i] = starts[i] < starts[i + 1]
+                                  ? parse_range(starts[i], starts[i + 1], end, region_group, unmatched, locals[i], names)
+                                  : starts[i];
                 });
             for (auto& t : th) t.join();
-        }
+            for (int i = 0; i < nt; ++i)
+                if (ends[i] != starts[i + 1]) return false;
+            return true;
+        };
 
-        // Pass 2: first record start in each chunk: just after a '\n' with an even quote count before it.
+        // Fast start finder. A newline inside a quoted note is always followed by a lowercase
+        // letter or a quote, and a record really starts after a newline followed by a digit (an
+        // id) or a byte order mark (spec 2.2: ids are [1-9][0-9]*, notes are lowercase words).
         std::vector<const char*> starts(nt + 1, end);
-        {
-            const char* hdr = static_cast<const char*>(memchr(base, '\n', rec.n)) + 1;  // skip BOM + header
+        starts[0] = hdr;
+        for (int i = 1; i < nt; ++i)
+            for (const char* x = std::max(chunk[i], hdr); x + 1 < end; ++x)
+                if (*x == '\n' && (static_cast<unsigned>(static_cast<uint8_t>(x[1]) - '0') < 10 || static_cast<uint8_t>(x[1]) == 0xEF)) {
+                    starts[i] = x + 1;
+                    break;
+                }
+        bool ok = parse_all(starts);
+
+        if (!ok) {
+            // Fallback, exact for any input: count the '"' bytes of every chunk, so the parity
+            // says whether a chunk starts inside quotes, and start at a '\n' with an even count.
+            for (auto& L : locals) L.agg.assign(groups, Agg());
+            names.reset(groups);
+            std::vector<uint8_t> parity(nt, 0);
+            {
+                std::vector<std::thread> th;
+                for (int i = 0; i < nt; ++i)
+                    th.emplace_back([&, i] {
+                        size_t c = 0;
+                        for (const char* x = chunk[i]; x < chunk[i + 1]; ++x) c += (*x == '"');
+                        parity[i] = c & 1;
+                    });
+                for (auto& t : th) t.join();
+            }
+            std::fill(starts.begin(), starts.end(), end);
             starts[0] = hdr;
             uint8_t inside = parity[0];
             for (int i = 1; i < nt; ++i) {
@@ -283,16 +320,7 @@ int main(int argc, char** argv) {
                 }
                 inside ^= parity[i];
             }
-        }
-
-        // Pass 3: parse every thread's records.
-        {
-            std::vector<std::thread> th;
-            for (int i = 0; i < nt; ++i)
-                th.emplace_back([&, i] {
-                    if (starts[i] < starts[i + 1]) parse_range(starts[i], starts[i + 1], end, region_group, unmatched, locals[i], names);
-                });
-            for (auto& t : th) t.join();
+            parse_all(starts);
         }
     }
 
