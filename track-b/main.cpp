@@ -52,6 +52,15 @@ int thread_count() {
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
 
+// Runs f(i) on threads 0..n-1 and waits for all of them.
+template <class F>
+void parallel(int n, F&& f) {
+    std::vector<std::thread> th;
+    for (int i = 1; i < n; ++i) th.emplace_back(f, i);
+    f(0);
+    for (auto& t : th) t.join();
+}
+
 // Token bytes: a-z and 0-9 map to themselves, A-Z fold to lower case, everything else is a separator (0).
 uint8_t g_class[256];
 
@@ -96,32 +105,32 @@ inline const char* tokenize_line(const char* p, const char* end, F&& f) {
     return end;
 }
 
-struct Slot {
-    uint64_t key = 0;
-    uint32_t id = 0;
-};
-
+// Open-addressing table from token key to term id. Most corpus tokens are probed, so the probe
+// walks a dense array of keys alone (8 bytes a slot, a quarter of it in each cache line pair)
+// and reads the id array only on a hit.
 struct Dict {
-    std::vector<Slot> slots;
+    std::vector<uint64_t> keys;
+    std::vector<uint32_t> ids;
     size_t mask = 0;
 
     void init(size_t terms) {
         size_t cap = 16;
-        while (cap < terms * 2) cap <<= 1;
-        slots.assign(cap, Slot());
+        while (cap < terms + terms / 2) cap <<= 1;
+        keys.assign(cap, 0);
+        ids.assign(cap, 0);
         mask = cap - 1;
     }
     void insert(uint64_t key, uint32_t id) {
         size_t i = key & mask;
-        while (slots[i].key) i = (i + 1) & mask;
-        slots[i] = {key, id};
+        while (keys[i]) i = (i + 1) & mask;
+        keys[i] = key;
+        ids[i] = id;
     }
     // Returns the term id, or UINT32_MAX when the key is not a query term.
     inline uint32_t find(uint64_t key) const {
         for (size_t i = key & mask;; i = (i + 1) & mask) {
-            const Slot& s = slots[i];
-            if (s.key == key) return s.id;
-            if (!s.key) return UINT32_MAX;
+            if (keys[i] == key) return ids[i];
+            if (!keys[i]) return UINT32_MAX;
         }
     }
 };
@@ -226,7 +235,8 @@ int main(int argc, char** argv) {
     const size_t W = (N + 63) / 64;
     std::vector<uint32_t> doc_off(N);
 
-    // ---- Pass 1: find the query terms in every document (one chunk of lines per thread).
+    // ---- Chunks of whole lines, one per thread. Every chunk after the first starts at a
+    // document whose id is a multiple of 64, so two threads never write the same bitset word.
     const int nt = docs.n < (1u << 20) ? 1 : thread_count();
     std::vector<const char*> cut(nt + 1);
     cut[0] = dbase;
@@ -234,37 +244,76 @@ int main(int argc, char** argv) {
     for (int i = 1; i < nt; ++i) {
         const char* p = dbase + docs.n * static_cast<size_t>(i) / static_cast<size_t>(nt);
         const char* nl = static_cast<const char*>(memchr(p - 1, '\n', static_cast<size_t>(dend - (p - 1))));
-        cut[i] = nl ? nl + 1 : dend;
+        p = nl ? nl + 1 : dend;
+        while (p < dend) {
+            uint32_t id = 0;
+            for (const char* x = p; *x != '\t'; ++x) id = id * 10 + static_cast<uint32_t>(*x - '0');
+            if (id % 64 == 0) break;
+            p = static_cast<const char*>(memchr(p, '\n', static_cast<size_t>(dend - p))) + 1;
+        }
+        cut[i] = std::max(p, cut[i - 1]);
     }
     std::vector<Worker> workers(nt);
-    {
-        std::vector<std::thread> th;
-        for (int i = 0; i < nt; ++i)
-            th.emplace_back([&, i] {
-                Worker& w = workers[i];
-                w.count.assign(Q, 0);
-                w.last.assign(Q, UINT32_MAX);
-                const char* p = cut[i];
-                const char* const e = std::max(cut[i], cut[i + 1]);
-                w.records.reserve(static_cast<size_t>(e - p) / 12 + 16);
-                while (p < e) {
-                    uint32_t doc = 0;
-                    for (const char* x = p; *x != '\t'; ++x) doc = doc * 10 + static_cast<uint32_t>(*x - '0');
-                    doc_off[doc] = static_cast<uint32_t>(p - dbase);
-                    p = tokenize_line(p, dend, [&](uint64_t key) {
-                        const uint32_t t = dict.find(key);
-                        if (t != UINT32_MAX && w.last[t] != doc) {
-                            w.last[t] = doc;
-                            ++w.count[t];
-                            w.records.push_back((static_cast<uint64_t>(t) << 32) | doc);
-                        }
-                    });
+
+    // ---- Estimate every term's document count from the first 1/32 of each chunk. A term
+    // expected in more than kDenseDf documents is "dense": the scan sets its bits directly
+    // instead of recording (term, document) pairs, which are most of the pairs.
+    std::vector<uint32_t> sampled(nt, 0);
+    parallel(nt, [&](int i) {
+        Worker& w = workers[i];
+        w.count.assign(Q, 0);
+        w.last.assign(Q, UINT32_MAX);
+        const char* p = cut[i];
+        const char* const e = std::min(std::max(cut[i], cut[i + 1]), cut[i] + (cut[i + 1] - cut[i]) / 32);
+        uint32_t doc = 0;
+        while (p < e) {
+            p = tokenize_line(p, dend, [&](uint64_t key) {
+                const uint32_t t = dict.find(key);
+                if (t != UINT32_MAX && w.last[t] != doc) { w.last[t] = doc; ++w.count[t]; }
+            });
+            ++doc;
+        }
+        sampled[i] = doc;
+    });
+    uint64_t sample_docs = 0;
+    for (uint32_t s : sampled) sample_docs += s;
+    std::vector<int32_t> dense_of(Q, -1);
+    uint32_t dense_count = 0;
+    for (uint32_t t = 0; t < Q; ++t) {
+        uint64_t seen = 0;
+        for (auto& w : workers) seen += w.count[t];
+        if (sample_docs && seen * N > uint64_t(kDenseDf) * sample_docs) dense_of[t] = static_cast<int32_t>(dense_count++);
+    }
+    std::vector<uint64_t> dense_bits(static_cast<size_t>(dense_count) * W, 0);
+
+    // ---- Pass 1: find the query terms in every document.
+    parallel(nt, [&](int i) {
+        Worker& w = workers[i];
+        std::fill(w.count.begin(), w.count.end(), 0);
+        std::fill(w.last.begin(), w.last.end(), UINT32_MAX);
+        const char* p = cut[i];
+        const char* const e = std::max(cut[i], cut[i + 1]);
+        w.records.reserve(static_cast<size_t>(e - p) / 40 + 16);
+        while (p < e) {
+            uint32_t doc = 0;
+            for (const char* x = p; *x != '\t'; ++x) doc = doc * 10 + static_cast<uint32_t>(*x - '0');
+            doc_off[doc] = static_cast<uint32_t>(p - dbase);
+            p = tokenize_line(p, dend, [&](uint64_t key) {
+                const uint32_t t = dict.find(key);
+                if (t == UINT32_MAX || w.last[t] == doc) return;
+                w.last[t] = doc;
+                if (dense_of[t] >= 0) {
+                    dense_bits[static_cast<size_t>(dense_of[t]) * W + (doc >> 6)] |= 1ull << (doc & 63);
+                } else {
+                    ++w.count[t];
+                    w.records.push_back((static_cast<uint64_t>(t) << 32) | doc);
                 }
             });
-        for (auto& t : th) t.join();
-    }
+        }
+    });
 
-    // ---- Posting lists: every worker's records go to their term's slice, already in document order.
+    // ---- Posting lists of the other terms: every worker's records go to their term's slice,
+    // already in document order.
     std::vector<uint32_t> start(Q + 1, 0);
     for (uint32_t t = 0; t < Q; ++t) {
         uint32_t run = start[t];
@@ -276,39 +325,25 @@ int main(int argc, char** argv) {
         start[t + 1] = run;
     }
     std::vector<uint32_t> postings(start[Q]);
-    {
-        std::vector<std::thread> th;
-        for (int i = 0; i < nt; ++i)
-            th.emplace_back([&, i] {
-                Worker& w = workers[i];
-                for (uint64_t r : w.records) postings[w.count[r >> 32]++] = static_cast<uint32_t>(r);
-                std::vector<uint64_t>().swap(w.records);
-            });
-        for (auto& t : th) t.join();
-    }
-
-    // ---- Bitsets for the terms that occur in many documents.
-    std::vector<int32_t> dense_of(Q, -1);
-    std::vector<uint32_t> dense_terms;
-    for (uint32_t t = 0; t < Q; ++t)
-        if (start[t + 1] - start[t] > kDenseDf) { dense_of[t] = static_cast<int32_t>(dense_terms.size()); dense_terms.push_back(t); }
-    std::vector<uint64_t> dense_bits(dense_terms.size() * W, 0);
-    {
-        std::atomic<size_t> next{0};
-        std::vector<std::thread> th;
-        for (int i = 0; i < nt; ++i)
-            th.emplace_back([&] {
-                for (size_t k; (k = next.fetch_add(1)) < dense_terms.size();) {
-                    uint64_t* b = dense_bits.data() + k * W;
-                    for (uint32_t j = start[dense_terms[k]]; j < start[dense_terms[k] + 1]; ++j) b[postings[j] >> 6] |= 1ull << (postings[j] & 63);
-                }
-            });
-        for (auto& t : th) t.join();
-    }
+    parallel(nt, [&](int i) {
+        Worker& w = workers[i];
+        for (uint64_t r : w.records) postings[w.count[r >> 32]++] = static_cast<uint32_t>(r);
+        std::vector<uint64_t>().swap(w.records);
+    });
+    std::vector<uint32_t> df(Q);
+    parallel(nt, [&](int i) {
+        for (uint32_t t = Q * uint64_t(i) / nt; t < Q * uint64_t(i + 1) / nt; ++t) {
+            if (dense_of[t] < 0) { df[t] = start[t + 1] - start[t]; continue; }
+            const uint64_t* b = dense_bits.data() + static_cast<size_t>(dense_of[t]) * W;
+            uint32_t c = 0;
+            for (size_t k = 0; k < W; ++k) c += static_cast<uint32_t>(__builtin_popcountll(b[k]));
+            df[t] = c;
+        }
+    });
     auto term_set = [&](uint32_t t) {
         TermSet s;
         s.list = postings.data() + start[t];
-        s.n = start[t + 1] - start[t];
+        s.n = df[t];
         s.bits = dense_of[t] >= 0 ? dense_bits.data() + static_cast<size_t>(dense_of[t]) * W : nullptr;
         return s;
     };
@@ -321,7 +356,6 @@ int main(int argc, char** argv) {
         for (int ti = 0; ti < nt; ++ti)
             th.emplace_back([&] {
                 std::vector<uint64_t> A(W), B(W);
-                std::vector<int32_t> toks;
                 std::vector<uint32_t> hits;
                 char buf[256];
                 constexpr size_t kBatch = 64;
@@ -373,10 +407,15 @@ int main(int argc, char** argv) {
                             // Documents holding every term, driven by the rarest term, then an exact check of each.
                             uint32_t drv = ids[0];
                             for (uint32_t k = 1; k < q.count; ++k)
-                                if (start[ids[k] + 1] - start[ids[k]] < start[drv + 1] - start[drv]) drv = ids[k];
+                                if (df[ids[k]] < df[drv]) drv = ids[k];
                             const TermSet sd = term_set(drv);
-                            for (uint32_t j = 0; j < sd.n; ++j) {
-                                const uint32_t d = sd.list[j];
+                            // The rarest term's documents, from its list or, for a dense term, its bitset.
+                            hits.clear();
+                            if (sd.bits) {
+                                for (size_t w = 0; w < W; ++w)
+                                    for (uint64_t bits = sd.bits[w]; bits; bits &= bits - 1) hits.push_back(static_cast<uint32_t>(w * 64 + static_cast<unsigned>(__builtin_ctzll(bits))));
+                            } else hits.assign(sd.list, sd.list + sd.n);
+                            for (const uint32_t d : hits) {
                                 bool ok = true;
                                 for (uint32_t k = 0; k < q.count && ok; ++k) {
                                     if (ids[k] == drv) continue;
@@ -384,17 +423,20 @@ int main(int argc, char** argv) {
                                     ok = s.bits ? (s.bits[d >> 6] >> (d & 63)) & 1 : std::binary_search(s.list, s.list + s.n, d);
                                 }
                                 if (!ok) continue;
-                                toks.clear();
-                                tokenize_line(dbase + doc_off[d], dend, [&](uint64_t key) {
-                                    const uint32_t t = dict.find(key);
-                                    toks.push_back(t == UINT32_MAX ? -1 : static_cast<int32_t>(t));
-                                });
+                                // Compare token keys with the phrase's keys directly (no table lookup),
+                                // keeping the last k keys in a ring.
+                                const uint32_t k = q.count;
+                                uint64_t ring[8];
+                                uint32_t pos = 0, seen = 0;
                                 bool found = false;
-                                for (size_t s = 0; s + q.count <= toks.size() && !found; ++s) {
+                                tokenize_line(dbase + doc_off[d], dend, [&](uint64_t key) {
+                                    ring[pos] = key;
+                                    pos = pos + 1 == k ? 0 : pos + 1;  // now the oldest of the last k
+                                    if (found || ++seen < k || key != keys[ids[k - 1]]) return;
                                     uint32_t m = 0;
-                                    while (m < q.count && toks[s + m] == static_cast<int32_t>(ids[m])) ++m;
-                                    found = m == q.count;
-                                }
+                                    for (uint32_t r = pos; m < k && ring[r] == keys[ids[m]]; r = r + 1 == k ? 0 : r + 1) ++m;
+                                    found = m == k;
+                                });
                                 if (found) take(d);
                             }
                         }
