@@ -164,8 +164,12 @@ int main(int argc, char** argv) {
 
     // CSR build.
     std::vector<uint32_t> off(n + 2, 0);
+    std::vector<uint8_t> has_in(n, 0);  // a node with no in-edge can only be reached from itself
     for (const auto& part : parts)
-        for (const Edge& e : part) ++off[e.u + 2];
+        for (const Edge& e : part) {
+            ++off[e.u + 2];
+            has_in[e.v] = 1;
+        }
     for (uint64_t i = 2; i < n + 2; ++i) off[i] += off[i - 1];
     // off[u + 1] is now the start of u's block; scattering advances it to the block end,
     // which is the start of u + 1's block.
@@ -196,8 +200,11 @@ int main(int argc, char** argv) {
         for (int i = 0; i < qt; ++i)
             th.emplace_back([&] {
                 Searcher s(off.data(), arcs.data(), n);
-                for (size_t k; (k = next.fetch_add(1)) < queries.size();)
-                    answer[k] = s.run(queries[k].first, queries[k].second);
+                for (size_t k; (k = next.fetch_add(1)) < queries.size();) {
+                    const auto [src, dst] = queries[k];
+                    // Without this check the search settles everything src can reach before giving up.
+                    answer[k] = (src != dst && !has_in[dst]) ? -1 : s.run(src, dst);
+                }
             });
         for (auto& t : th) t.join();
     }
