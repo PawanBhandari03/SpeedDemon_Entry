@@ -6,8 +6,8 @@
 // its chunk (a '\n' seen with an even number of quotes before it) and then parse records with a
 // proper CSV state machine until it reaches the next thread's first record. Each record is
 // joined to its country through a flat region_id -> group table. Per-group sums are kept per
-// thread and added at the end. Distinct names are counted by hashing each unescaped name and
-// sorting the (group, hash) keys.
+// thread and added at the end. Distinct names are counted by hashing each unescaped name into a
+// per-group list and de-duplicating each group's lists in a small hash set.
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -79,7 +79,7 @@ struct Agg {
 
 struct Local {
     std::vector<Agg> agg;
-    std::vector<uint64_t> keys;  // (group << 48) | 48-bit name hash, one per record
+    std::vector<std::vector<uint64_t>> names;  // per group: the hash of every record's name
     std::string scratch;
 };
 
@@ -90,14 +90,15 @@ inline uint64_t read_digits(const char*& p) {
     return v;
 }
 
-// Scans one text field starting at p. Sets the unescaped length and hash and moves p past the
-// field (to the ',' after it). A quoted field ends at the first '"' that is not part of a "" pair.
-inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, uint64_t& hash) {
+// Scans one text field starting at p. Sets the unescaped length (and the hash of the unescaped
+// value when hash is not null) and moves p past the field, to the ',' after it. A quoted field
+// ends at the first '"' that is not part of a "" pair.
+inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, uint64_t* hash) {
     if (*p != '"') {
         const char* s = p;
         while (*p != ',') ++p;
         len = static_cast<size_t>(p - s);
-        hash = hash_bytes(s, len);
+        if (hash) *hash = hash_bytes(s, len);
         return;
     }
     const char* s = ++p;
@@ -112,8 +113,9 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     p = q + 1;
     const size_t raw = static_cast<size_t>(q - s);
     len = raw - escapes;
+    if (!hash) return;
     if (!escapes) {
-        hash = hash_bytes(s, raw);
+        *hash = hash_bytes(s, raw);
         return;
     }
     L.scratch.clear();
@@ -121,22 +123,22 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
         L.scratch.push_back(*x);
         if (*x == '"') ++x;  // second quote of the pair
     }
-    hash = hash_bytes(L.scratch.data(), L.scratch.size());
+    *hash = hash_bytes(L.scratch.data(), L.scratch.size());
 }
 
 void parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
                  uint16_t unmatched, Local& L) {
-    L.keys.reserve(static_cast<size_t>(stop - p) / 50 + 16);
+    for (auto& v : L.names) v.reserve(static_cast<size_t>(stop - p) / 60 / L.names.size() + 16);
     while (p < stop) {
         if (static_cast<uint8_t>(p[0]) == 0xEF && static_cast<uint8_t>(p[1]) == 0xBB && static_cast<uint8_t>(p[2]) == 0xBF)
             p += 3;  // byte order mark at the start of a record
         const uint64_t id = read_digits(p);
         ++p;
         size_t name_len, note_len;
-        uint64_t name_hash, note_hash;
-        scan_text(p, end, L, name_len, name_hash);
+        uint64_t name_hash;
+        scan_text(p, end, L, name_len, &name_hash);
         ++p;
-        scan_text(p, end, L, note_len, note_hash);
+        scan_text(p, end, L, note_len, nullptr);  // only the note's length matters
         ++p;
         const uint64_t region = read_digits(p);
         ++p;
@@ -159,7 +161,7 @@ void parse_range(const char* p, const char* stop, const char* end, const std::ve
         a.max = std::max(a.max, cents);
         a.name_bytes += name_len;
         a.note_bytes += note_len;
-        L.keys.push_back((static_cast<uint64_t>(g) << 48) | (name_hash & 0xFFFFFFFFFFFFull));
+        L.names[g].push_back(name_hash);
     }
 }
 
@@ -183,7 +185,10 @@ int main(int argc, char** argv) {
     // regions.csv: "region_id,country" header, then one "id,CCC" line per region.
     const Mapped reg = map_file(data + "/regions.csv");
     if (!reg.p) return 1;
-    std::vector<std::pair<uint32_t, uint32_t>> regions;  // (region_id, packed country code)
+    // A code is three letters A-Z, so it indexes a 26^3 table directly, and that index order is
+    // the bytewise order of the codes.
+    std::vector<std::pair<uint32_t, uint16_t>> regions;  // (region_id, code index)
+    std::vector<uint16_t> code_group(26 * 26 * 26, kNoGroup);
     uint32_t max_id = 0;
     {
         const char* p = static_cast<const char*>(memchr(reg.p, '\n', reg.n)) + 1;
@@ -191,21 +196,19 @@ int main(int argc, char** argv) {
         while (p < e) {
             const uint32_t id = static_cast<uint32_t>(read_digits(p));
             ++p;
-            const uint32_t code = (static_cast<uint32_t>(static_cast<uint8_t>(p[0])) << 16) |
-                                  (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 8) | static_cast<uint8_t>(p[2]);
+            const uint16_t code = static_cast<uint16_t>((p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A'));
             p += 4;  // code and LF
             regions.emplace_back(id, code);
+            code_group[code] = 0;
             max_id = std::max(max_id, id);
         }
     }
-    std::vector<uint32_t> codes;
-    for (auto& r : regions) codes.push_back(r.second);
-    std::sort(codes.begin(), codes.end());
-    codes.erase(std::unique(codes.begin(), codes.end()), codes.end());  // sorted bytewise = output order
+    std::vector<uint16_t> codes;  // group -> code index
+    for (uint16_t c = 0; c < code_group.size(); ++c)
+        if (code_group[c] != kNoGroup) { code_group[c] = static_cast<uint16_t>(codes.size()); codes.push_back(c); }
     const uint16_t unmatched = static_cast<uint16_t>(codes.size());
     std::vector<uint16_t> region_group(static_cast<size_t>(max_id) + 1, kNoGroup);
-    for (auto& r : regions)
-        region_group[r.first] = static_cast<uint16_t>(std::lower_bound(codes.begin(), codes.end(), r.second) - codes.begin());
+    for (auto& r : regions) region_group[r.first] = code_group[r.second];
     const size_t groups = codes.size() + 1;
 
     const Mapped rec = map_file(data + "/records.csv");
@@ -216,7 +219,10 @@ int main(int argc, char** argv) {
         const char* const end = base + rec.n;
         nt = rec.n < (1u << 20) ? 1 : thread_count();
         locals.resize(nt);
-        for (auto& L : locals) L.agg.assign(groups, Agg());
+        for (auto& L : locals) {
+            L.agg.assign(groups, Agg());
+            L.names.resize(groups);
+        }
 
         // Pass 1: parity of the quote count in every chunk.
         std::vector<const char*> chunk(nt + 1);
@@ -275,32 +281,29 @@ int main(int argc, char** argv) {
             t.note_bytes += a.note_bytes;
         }
 
-    // Distinct names per group: sort each thread's keys, then per group gather, sort and count unique.
+    // Distinct names per group: one small open-addressing set of name hashes per group, filled
+    // from every thread's list for that group. The groups are shared out between the threads.
     std::vector<uint64_t> distinct(groups, 0);
     {
-        std::atomic<size_t> next_sort{0};
+        std::atomic<size_t> next_group{0};
         std::vector<std::thread> th;
         for (int i = 0; i < nt; ++i)
             th.emplace_back([&] {
-                for (size_t k; (k = next_sort.fetch_add(1)) < locals.size();)
-                    std::sort(locals[k].keys.begin(), locals[k].keys.end());
-            });
-        for (auto& t : th) t.join();
-        th.clear();
-        std::atomic<size_t> next_group{0};
-        for (int i = 0; i < nt; ++i)
-            th.emplace_back([&] {
-                std::vector<uint64_t> tmp;
+                std::vector<uint64_t> set;
                 for (size_t g; (g = next_group.fetch_add(1)) < groups;) {
-                    tmp.clear();
-                    const uint64_t lo = static_cast<uint64_t>(g) << 48, hi = static_cast<uint64_t>(g + 1) << 48;
-                    for (auto& L : locals) {
-                        auto b = std::lower_bound(L.keys.begin(), L.keys.end(), lo);
-                        auto e = std::lower_bound(b, L.keys.end(), hi);
-                        tmp.insert(tmp.end(), b, e);
-                    }
-                    std::sort(tmp.begin(), tmp.end());
-                    distinct[g] = static_cast<uint64_t>(std::unique(tmp.begin(), tmp.end()) - tmp.begin());
+                    size_t n = 0, cap = 16;
+                    for (auto& L : locals) n += L.names[g].size();
+                    while (cap < 2 * n) cap <<= 1;
+                    set.assign(cap, 0);
+                    uint64_t unique = 0;
+                    for (auto& L : locals)
+                        for (uint64_t h : L.names[g]) {
+                            h |= 1;  // 0 marks an empty slot
+                            size_t k = h & (cap - 1);
+                            while (set[k] && set[k] != h) k = (k + 1) & (cap - 1);
+                            if (!set[k]) { set[k] = h; ++unique; }
+                        }
+                    distinct[g] = unique;
                 }
             });
         for (auto& t : th) t.join();
@@ -312,9 +315,9 @@ int main(int argc, char** argv) {
         if (!a.count) continue;
         if (g == unmatched) out += "_UNMATCHED";
         else {
-            out += static_cast<char>(codes[g] >> 16);
-            out += static_cast<char>(codes[g] >> 8);
-            out += static_cast<char>(codes[g]);
+            out += static_cast<char>('A' + codes[g] / 676);
+            out += static_cast<char>('A' + codes[g] / 26 % 26);
+            out += static_cast<char>('A' + codes[g] % 26);
         }
         out += ' ' + std::to_string(a.count) + ' ' + std::to_string(a.id_sum) + ' ';
         put_cents(out, a.sum);
