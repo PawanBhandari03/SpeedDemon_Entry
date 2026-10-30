@@ -4,5 +4,5 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | | | | | |
+| 0 | The reference, unchanged | | 56.9 | 2199 | 0 |
+| 1 | C++ rewrite: index only the query terms, parallel tokenization with a hash lookup per token, sorted posting lists by construction, bitsets for common terms, phrase check by re-tokenizing the candidates. Local hash check passes on sample and full. | | | | |
