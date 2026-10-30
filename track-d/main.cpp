@@ -2,9 +2,11 @@
 //
 // Plan: mmap graph.txt, cut it into one chunk per thread at newline boundaries and parse the
 // edges in parallel. A counting sort turns the edge list into a compressed-sparse-row graph
-// (one flat array of (head, weight) arcs, grouped by tail). The 2,000 queries are then
-// answered in parallel, each by a Dijkstra search that stops when the target is settled. A
-// search only resets the nodes it touched, so no per-query clearing of the whole graph.
+// (one flat array of (head, weight) arcs, grouped by tail); the threads build it together with
+// atomic counters. The 2,000 queries are then answered in parallel, each by a Dijkstra search
+// that stops when the target is settled. A search only resets the nodes it touched, so no
+// per-query clearing of the whole graph. Distances are kept in 32 bits, which halves the
+// per-thread arrays; the rare search that would pass 2^32 - 1 is redone with 64-bit distances.
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -12,8 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -28,7 +33,7 @@ namespace {
 struct Edge { uint32_t u, v, w; };
 struct Arc { uint32_t to, w; };
 
-constexpr uint64_t kInf = ~0ull;
+constexpr int64_t kOverflow = -2;
 
 struct Mapped {
     const char* p = nullptr;
@@ -64,36 +69,60 @@ int thread_count() {
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
 
-// Dijkstra with a binary heap on a reusable distance array.
+template <class F>
+void parallel(int n, F&& f) {
+    std::vector<std::thread> th;
+    for (int i = 1; i < n; ++i) th.emplace_back(f, i);
+    f(0);
+    for (auto& t : th) t.join();
+}
+
+// Dijkstra with a binary heap on a reusable distance array of type D (uint32_t or uint64_t).
+// With 32-bit distances a heap entry is (distance << 32 | node) in one integer, so a
+// comparison is one integer compare.
+template <class D>
 struct Searcher {
+    static constexpr D kInf = std::numeric_limits<D>::max();
+    using Entry = std::conditional_t<sizeof(D) == 4, uint64_t, std::pair<uint64_t, uint32_t>>;
+
     const uint32_t* off;
     const Arc* arcs;
-    std::vector<uint64_t> dist;
+    std::vector<D> dist;
     std::vector<uint32_t> touched;
-    std::vector<std::pair<uint64_t, uint32_t>> heap;
+    std::vector<Entry> heap;
 
     Searcher(const uint32_t* o, const Arc* a, size_t n) : off(o), arcs(a), dist(n, kInf) {}
 
+    static Entry entry(uint64_t d, uint32_t v) {
+        if constexpr (sizeof(D) == 4) return d << 32 | v;
+        else return {d, v};
+    }
+
+    // Distance from s to t, -1 if unreachable, or kOverflow if D is too small for this search.
     int64_t run(uint32_t s, uint32_t t) {
         if (s == t) return 0;
-        const auto cmp = std::greater<std::pair<uint64_t, uint32_t>>();
+        const auto cmp = std::greater<Entry>();
         int64_t result = -1;
         dist[s] = 0;
         touched.push_back(s);
-        heap.emplace_back(0, s);
+        heap.push_back(entry(0, s));
         while (!heap.empty()) {
             std::pop_heap(heap.begin(), heap.end(), cmp);
-            const auto [d, u] = heap.back();
+            uint64_t d;
+            uint32_t u;
+            if constexpr (sizeof(D) == 4) { d = heap.back() >> 32; u = static_cast<uint32_t>(heap.back()); }
+            else { d = heap.back().first; u = heap.back().second; }
             heap.pop_back();
             if (d > dist[u]) continue;  // stale entry
             if (u == t) { result = static_cast<int64_t>(d); break; }
             for (uint32_t i = off[u], e = off[u + 1]; i < e; ++i) {
                 const uint64_t nd = d + arcs[i].w;
                 const uint32_t v = arcs[i].to;
+                if (nd >= kInf) { result = kOverflow; heap.clear(); break; }
                 if (nd < dist[v]) {
                     if (dist[v] == kInf) touched.push_back(v);
-                    dist[v] = nd;
-                    heap.emplace_back(nd, v);
+                    dist[v] = static_cast<D>(nd);
+                    heap.push_back(entry(nd, v));
                     std::push_heap(heap.begin(), heap.end(), cmp);
                 }
             }
@@ -144,40 +173,73 @@ int main(int argc, char** argv) {
         cut[i] = nl ? nl + 1 : end;
     }
     std::vector<std::vector<Edge>> parts(nt);
-    {
-        std::vector<std::thread> th;
-        for (int i = 0; i < nt; ++i)
-            th.emplace_back([&, i] {
-                const char* p = cut[i];
-                const char* e = std::max(cut[i], cut[i + 1]);
-                auto& v = parts[i];
-                v.reserve(static_cast<size_t>(e - p) / 12 + 16);
-                while (p < e) {
-                    const uint32_t u = static_cast<uint32_t>(read_uint(p)); ++p;
-                    const uint32_t w2 = static_cast<uint32_t>(read_uint(p)); ++p;
-                    const uint32_t wt = static_cast<uint32_t>(read_uint(p)); ++p;
-                    v.push_back({u, w2, wt});
-                }
-            });
-        for (auto& t : th) t.join();
-    }
+    parallel(nt, [&](int i) {
+        const char* p = cut[i];
+        const char* e = std::max(cut[i], cut[i + 1]);
+        auto& v = parts[i];
+        v.reserve(static_cast<size_t>(e - p) / 12 + 16);
+        while (p < e) {
+            const uint32_t u = static_cast<uint32_t>(read_uint(p)); ++p;
+            const uint32_t to = static_cast<uint32_t>(read_uint(p)); ++p;
+            const uint32_t w = static_cast<uint32_t>(read_uint(p)); ++p;
+            v.push_back({u, to, w});
+        }
+    });
 
-    // CSR build.
+    // CSR build, all threads at once: out-degree counts, prefix sums, then each edge claims a
+    // slot in its tail's block. The order of arcs inside a block does not change any distance.
     std::vector<uint32_t> off(n + 2, 0);
     std::vector<uint8_t> has_in(n, 0);  // a node with no in-edge can only be reached from itself
-    for (const auto& part : parts)
-        for (const Edge& e : part) {
-            ++off[e.u + 2];
-            has_in[e.v] = 1;
+    parallel(nt, [&](int i) {
+        for (const Edge& e : parts[i]) {
+            std::atomic_ref<uint32_t>(off[e.u + 2]).fetch_add(1, std::memory_order_relaxed);
+            std::atomic_ref<uint8_t>(has_in[e.v]).store(1, std::memory_order_relaxed);
         }
+    });
     for (uint64_t i = 2; i < n + 2; ++i) off[i] += off[i - 1];
-    // off[u + 1] is now the start of u's block; scattering advances it to the block end,
+    // off[u + 1] is now the start of u's block; claiming slots advances it to the block end,
     // which is the start of u + 1's block.
     std::vector<Arc> arcs(m);
-    for (const auto& part : parts)
-        for (const Edge& e : part) arcs[off[e.u + 1]++] = {e.v, e.w};
-    parts.clear();
-    parts.shrink_to_fit();
+    parallel(nt, [&](int i) {
+        for (const Edge& e : parts[i]) arcs[std::atomic_ref<uint32_t>(off[e.u + 1]).fetch_add(1, std::memory_order_relaxed)] = {e.v, e.w};
+        std::vector<Edge>().swap(parts[i]);
+    });
+
+    // Renumber the nodes in breadth-first order. The input ids are a random shuffle, so a
+    // search jumps all over the arrays; after renumbering, nodes that are close on the map
+    // are close in memory and a search stays inside a few cache-friendly ranges.
+    std::vector<uint32_t> order;  // new id -> old id
+    order.reserve(n);
+    std::vector<uint32_t> new_id(n, UINT32_MAX);
+    for (uint32_t root = 0; root < n; ++root) {
+        if (new_id[root] != UINT32_MAX) continue;
+        new_id[root] = static_cast<uint32_t>(order.size());
+        order.push_back(root);
+        for (size_t head = order.size() - 1; head < order.size(); ++head)
+            for (uint32_t i = off[order[head]], e = off[order[head] + 1]; i < e; ++i) {
+                const uint32_t v = arcs[i].to;
+                if (new_id[v] == UINT32_MAX) { new_id[v] = static_cast<uint32_t>(order.size()); order.push_back(v); }
+            }
+    }
+    {
+        std::vector<uint32_t> off2(n + 1, 0);
+        std::vector<uint8_t> has_in2(n);
+        for (uint32_t x = 0; x < n; ++x) {
+            off2[x + 1] = off2[x] + (off[order[x] + 1] - off[order[x]]);
+            has_in2[x] = has_in[order[x]];
+        }
+        std::vector<Arc> arcs2(m);
+        parallel(nt, [&](int i) {
+            for (uint64_t x = n * i / nt; x < n * (i + 1) / nt; ++x) {
+                uint32_t pos = off2[x];
+                for (uint32_t j = off[order[x]], e = off[order[x] + 1]; j < e; ++j) arcs2[pos++] = {new_id[arcs[j].to], arcs[j].w};
+            }
+        });
+        off.swap(off2);
+        arcs.swap(arcs2);
+        has_in.swap(has_in2);
+    }
+    std::vector<uint32_t>().swap(order);
 
     // Queries.
     std::vector<std::pair<uint32_t, uint32_t>> queries;
@@ -188,7 +250,7 @@ int main(int argc, char** argv) {
         while (p < e) {
             const uint32_t s = static_cast<uint32_t>(read_uint(p)); ++p;
             const uint32_t t = static_cast<uint32_t>(read_uint(p)); ++p;
-            queries.emplace_back(s, t);
+            queries.emplace_back(new_id[s], new_id[t]);
         }
     }
 
@@ -196,17 +258,20 @@ int main(int argc, char** argv) {
     {
         const int qt = static_cast<int>(std::min<size_t>(thread_count(), std::max<size_t>(1, queries.size())));
         std::atomic<size_t> next{0};
-        std::vector<std::thread> th;
-        for (int i = 0; i < qt; ++i)
-            th.emplace_back([&] {
-                Searcher s(off.data(), arcs.data(), n);
-                for (size_t k; (k = next.fetch_add(1)) < queries.size();) {
-                    const auto [src, dst] = queries[k];
-                    // Without this check the search settles everything src can reach before giving up.
-                    answer[k] = (src != dst && !has_in[dst]) ? -1 : s.run(src, dst);
+        parallel(qt, [&](int) {
+            Searcher<uint32_t> s32(off.data(), arcs.data(), n);
+            std::unique_ptr<Searcher<uint64_t>> s64;  // made only if some search overflows 32 bits
+            for (size_t k; (k = next.fetch_add(1)) < queries.size();) {
+                const auto [src, dst] = queries[k];
+                // Without this check the search settles everything src can reach before giving up.
+                if (src != dst && !has_in[dst]) { answer[k] = -1; continue; }
+                answer[k] = s32.run(src, dst);
+                if (answer[k] == kOverflow) {
+                    if (!s64) s64 = std::make_unique<Searcher<uint64_t>>(off.data(), arcs.data(), n);
+                    answer[k] = s64->run(src, dst);
                 }
-            });
-        for (auto& t : th) t.join();
+            }
+        });
     }
 
     std::string result;
