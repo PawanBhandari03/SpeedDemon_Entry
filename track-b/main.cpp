@@ -83,8 +83,8 @@ inline uint64_t finish_key(uint64_t h, uint32_t len) {
     return h ? h : 1;
 }
 
-// Calls f(key) for every token of one document line starting at p (the id, a TAB, then the text).
-// Returns a pointer just past the line's LF.
+// Calls f(key, start) for every token of one document line starting at p (the id, a TAB, then
+// the text); start points at the token's first byte. Returns a pointer just past the line's LF.
 template <class F>
 inline const char* tokenize_line(const char* p, const char* end, F&& f) {
     while (p < end && *p != '\t') ++p;
@@ -97,12 +97,36 @@ inline const char* tokenize_line(const char* p, const char* end, F&& f) {
             h = (h ^ c) * kFnvPrime;
             ++len;
         } else {
-            if (len) { f(finish_key(h, len)); h = kFnvBasis; len = 0; }
+            if (len) { f(finish_key(h, len), p - len); h = kFnvBasis; len = 0; }
             if (*p == '\n') return p + 1;
         }
     }
-    if (len) f(finish_key(h, len));
+    if (len) f(finish_key(h, len), p - len);
     return end;
+}
+
+// True when the k keys in want are k consecutive tokens of the text [begin, ...) and the m-th
+// of them starts at `at`: walks back m tokens from `at`, then hashes k tokens forward.
+inline bool window_match(const char* begin, const char* at, const uint64_t* want, uint32_t k, uint32_t m) {
+    const char* p = at;
+    for (uint32_t r = 0; r < m; ++r) {
+        const char* q = p - 1;
+        while (q >= begin && !g_class[static_cast<uint8_t>(*q)]) --q;  // separators before the token
+        if (q < begin) return false;
+        while (q >= begin && g_class[static_cast<uint8_t>(*q)]) --q;   // the token itself
+        p = q + 1;
+    }
+    for (uint32_t i = 0; i < k; ++i) {
+        while (!g_class[static_cast<uint8_t>(*p)]) {
+            if (*p == '\n') return false;
+            ++p;
+        }
+        uint64_t h = kFnvBasis;
+        uint32_t len = 0;
+        for (uint8_t c; (c = g_class[static_cast<uint8_t>(*p)]); ++p, ++len) h = (h ^ c) * kFnvPrime;
+        if (finish_key(h, len) != want[i]) return false;
+    }
+    return true;
 }
 
 // Open-addressing table from token key to term id. Most corpus tokens are probed, so the probe
@@ -136,9 +160,10 @@ struct Dict {
 };
 
 struct Worker {
-    std::vector<uint64_t> records;  // (term << 32) | doc, in document order
-    std::vector<uint32_t> count;    // documents per term seen by this worker
-    std::vector<uint32_t> last;     // last document recorded for each term, to count a document once
+    std::vector<uint64_t> records;  // (term << 32) | doc, one per occurrence of a rare term, in file order
+    std::vector<uint32_t> offs;     // file offset of each of those occurrences
+    std::vector<uint32_t> count;    // occurrences per term seen by this worker
+    std::vector<uint32_t> last;     // last document seen for each dense term, to set its bit once
 };
 
 struct TermSet {
@@ -267,7 +292,7 @@ int main(int argc, char** argv) {
         const char* const e = std::min(std::max(cut[i], cut[i + 1]), cut[i] + (cut[i + 1] - cut[i]) / 32);
         uint32_t doc = 0;
         while (p < e) {
-            p = tokenize_line(p, dend, [&](uint64_t key) {
+            p = tokenize_line(p, dend, [&](uint64_t key, const char*) {
                 const uint32_t t = dict.find(key);
                 if (t != UINT32_MAX && w.last[t] != doc) { w.last[t] = doc; ++w.count[t]; }
             });
@@ -294,20 +319,26 @@ int main(int argc, char** argv) {
         const char* p = cut[i];
         const char* const e = std::max(cut[i], cut[i + 1]);
         w.records.reserve(static_cast<size_t>(e - p) / 40 + 16);
+        w.offs.reserve(static_cast<size_t>(e - p) / 40 + 16);
         while (p < e) {
             uint32_t doc = 0;
             for (const char* x = p; *x != '\t'; ++x) doc = doc * 10 + static_cast<uint32_t>(*x - '0');
             doc_off[doc] = static_cast<uint32_t>(p - dbase);
-            p = tokenize_line(p, dend, [&](uint64_t key) {
+            p = tokenize_line(p, dend, [&](uint64_t key, const char* at) {
                 const uint32_t t = dict.find(key);
-                if (t == UINT32_MAX || w.last[t] == doc) return;
-                w.last[t] = doc;
+                if (t == UINT32_MAX) return;
                 if (dense_of[t] >= 0) {
-                    dense_bits[static_cast<size_t>(dense_of[t]) * W + (doc >> 6)] |= 1ull << (doc & 63);
-                } else {
-                    ++w.count[t];
-                    w.records.push_back((static_cast<uint64_t>(t) << 32) | doc);
+                    if (w.last[t] != doc) {
+                        w.last[t] = doc;
+                        dense_bits[static_cast<size_t>(dense_of[t]) * W + (doc >> 6)] |= 1ull << (doc & 63);
+                    }
+                    return;
                 }
+                // A rare term keeps every occurrence with its offset, so a phrase check can start
+                // right at it instead of re-reading the whole document.
+                ++w.count[t];
+                w.records.push_back((static_cast<uint64_t>(t) << 32) | doc);
+                w.offs.push_back(static_cast<uint32_t>(at - dbase));
             });
         }
     });
@@ -324,11 +355,16 @@ int main(int argc, char** argv) {
         }
         start[t + 1] = run;
     }
-    std::vector<uint32_t> postings(start[Q]);
+    std::vector<uint32_t> postings(start[Q]), post_off(start[Q]);
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
-        for (uint64_t r : w.records) postings[w.count[r >> 32]++] = static_cast<uint32_t>(r);
+        for (size_t j = 0; j < w.records.size(); ++j) {
+            const uint32_t at = w.count[w.records[j] >> 32]++;
+            postings[at] = static_cast<uint32_t>(w.records[j]);
+            post_off[at] = w.offs[j];
+        }
         std::vector<uint64_t>().swap(w.records);
+        std::vector<uint32_t>().swap(w.offs);
     });
     std::vector<uint32_t> df(Q);
     parallel(nt, [&](int i) {
@@ -356,7 +392,6 @@ int main(int argc, char** argv) {
         for (int ti = 0; ti < nt; ++ti)
             th.emplace_back([&] {
                 std::vector<uint64_t> A(W), B(W);
-                std::vector<uint32_t> hits;
                 char buf[256];
                 constexpr size_t kBatch = 64;
                 for (size_t q0; (q0 = next.fetch_add(kBatch)) < queries.size();)
@@ -409,35 +444,54 @@ int main(int argc, char** argv) {
                             for (uint32_t k = 1; k < q.count; ++k)
                                 if (df[ids[k]] < df[drv]) drv = ids[k];
                             const TermSet sd = term_set(drv);
-                            // The rarest term's documents, from its list or, for a dense term, its bitset.
-                            hits.clear();
-                            if (sd.bits) {
-                                for (size_t w = 0; w < W; ++w)
-                                    for (uint64_t bits = sd.bits[w]; bits; bits &= bits - 1) hits.push_back(static_cast<uint32_t>(w * 64 + static_cast<unsigned>(__builtin_ctzll(bits))));
-                            } else hits.assign(sd.list, sd.list + sd.n);
-                            for (const uint32_t d : hits) {
-                                bool ok = true;
-                                for (uint32_t k = 0; k < q.count && ok; ++k) {
-                                    if (ids[k] == drv) continue;
-                                    const TermSet s = term_set(ids[k]);
-                                    ok = s.bits ? (s.bits[d >> 6] >> (d & 63)) & 1 : std::binary_search(s.list, s.list + s.n, d);
+                            const uint32_t k = q.count;
+                            uint64_t want[8];
+                            for (uint32_t m = 0; m < k; ++m) want[m] = keys[ids[m]];
+                            auto has_others = [&](uint32_t d) {
+                                for (uint32_t m = 0; m < k; ++m) {
+                                    if (ids[m] == drv) continue;
+                                    const TermSet s = term_set(ids[m]);
+                                    if (!(s.bits ? (s.bits[d >> 6] >> (d & 63)) & 1 : std::binary_search(s.list, s.list + s.n, d))) return false;
                                 }
-                                if (!ok) continue;
-                                // Compare token keys with the phrase's keys directly (no table lookup),
-                                // keeping the last k keys in a ring.
-                                const uint32_t k = q.count;
-                                uint64_t ring[8];
-                                uint32_t pos = 0, seen = 0;
-                                bool found = false;
-                                tokenize_line(dbase + doc_off[d], dend, [&](uint64_t key) {
-                                    ring[pos] = key;
-                                    pos = pos + 1 == k ? 0 : pos + 1;  // now the oldest of the last k
-                                    if (found || ++seen < k || key != keys[ids[k - 1]]) return;
-                                    uint32_t m = 0;
-                                    for (uint32_t r = pos; m < k && ring[r] == keys[ids[m]]; r = r + 1 == k ? 0 : r + 1) ++m;
-                                    found = m == k;
-                                });
-                                if (found) take(d);
+                                return true;
+                            };
+                            if (!sd.bits) {
+                                // A rare driver lists every occurrence with its offset: check only the
+                                // k tokens around each one, at every phrase position the driver takes.
+                                const uint32_t* offs = post_off.data() + start[drv];
+                                uint32_t cur = UINT32_MAX;
+                                bool cur_ok = false, cur_found = false;
+                                for (uint32_t j = 0; j < sd.n; ++j) {
+                                    const uint32_t d = sd.list[j];
+                                    if (d != cur) { cur = d; cur_found = false; cur_ok = has_others(d); }
+                                    if (!cur_ok || cur_found) continue;
+                                    const char* begin = dbase + doc_off[d];
+                                    while (*begin != '\t') ++begin;
+                                    ++begin;  // the text starts after the TAB
+                                    for (uint32_t m = 0; m < k && !cur_found; ++m)
+                                        if (ids[m] == drv) cur_found = window_match(begin, dbase + offs[j], want, k, m);
+                                    if (cur_found) take(d);
+                                }
+                            } else {
+                                // Every term is common (rare in the query mix): scan each candidate
+                                // document, comparing token keys with a ring of the last k keys.
+                                for (size_t w = 0; w < W; ++w)
+                                    for (uint64_t bits = sd.bits[w]; bits; bits &= bits - 1) {
+                                        const uint32_t d = static_cast<uint32_t>(w * 64 + static_cast<unsigned>(__builtin_ctzll(bits)));
+                                        if (!has_others(d)) continue;
+                                        uint64_t ring[8];
+                                        uint32_t pos = 0, seen = 0;
+                                        bool found = false;
+                                        tokenize_line(dbase + doc_off[d], dend, [&](uint64_t key, const char*) {
+                                            ring[pos] = key;
+                                            pos = pos + 1 == k ? 0 : pos + 1;  // now the oldest of the last k
+                                            if (found || ++seen < k || key != want[k - 1]) return;
+                                            uint32_t m = 0;
+                                            for (uint32_t r = pos; m < k && ring[r] == want[m]; r = r + 1 == k ? 0 : r + 1) ++m;
+                                            found = m == k;
+                                        });
+                                        if (found) take(d);
+                                    }
                             }
                         }
                         char* o = put_u64(buf, count);
