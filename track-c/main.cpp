@@ -6,8 +6,8 @@
 // its chunk (a '\n' seen with an even number of quotes before it) and then parse records with a
 // proper CSV state machine until it reaches the next thread's first record. Each record is
 // joined to its country through a flat region_id -> group table. Per-group sums are kept per
-// thread and added at the end. Distinct names are counted by hashing each unescaped name into a
-// per-group list and de-duplicating each group's lists in a small hash set.
+// thread and added at the end. Distinct names are counted with one shared table of name
+// hashes and a per-group bitset over its slots.
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -79,8 +79,40 @@ struct Agg {
 
 struct Local {
     std::vector<Agg> agg;
-    std::vector<std::vector<uint64_t>> names;  // per group: the hash of every record's name
     std::string scratch;
+};
+
+// Distinct names. The spec draws names from a pool of 100,000 values, so every distinct name
+// gets a slot in one table shared by all threads (compare-and-swap on the key), and each group
+// keeps a bitset over the slots it has seen. Memory is a few MB instead of one hash per record.
+struct NameSet {
+    static constexpr size_t kCap = size_t(1) << 18;
+    uint64_t* keys = static_cast<uint64_t*>(calloc(kCap, sizeof(uint64_t)));
+    uint64_t* bits = nullptr;  // groups x kCap bits
+
+    void init(size_t groups) { bits = static_cast<uint64_t*>(calloc(groups * (kCap / 64), sizeof(uint64_t))); }
+
+    size_t slot_of(uint64_t h) {
+        h |= 1;  // 0 marks an empty slot
+        for (size_t i = h & (kCap - 1);; i = (i + 1) & (kCap - 1)) {
+            std::atomic_ref<uint64_t> key(keys[i]);
+            uint64_t cur = key.load(std::memory_order_relaxed);
+            if (cur == 0 && key.compare_exchange_strong(cur, h, std::memory_order_relaxed)) return i;
+            if (cur == h) return i;  // also when another thread just stored this same key
+        }
+    }
+    void add(size_t group, uint64_t h) {
+        const size_t s = slot_of(h);
+        uint64_t& w = bits[group * (kCap / 64) + s / 64];
+        const uint64_t bit = 1ull << (s % 64);
+        if (!(std::atomic_ref<uint64_t>(w).load(std::memory_order_relaxed) & bit))
+            std::atomic_ref<uint64_t>(w).fetch_or(bit, std::memory_order_relaxed);
+    }
+    uint64_t distinct(size_t group) const {
+        uint64_t c = 0;
+        for (size_t w = 0; w < kCap / 64; ++w) c += static_cast<uint64_t>(__builtin_popcountll(bits[group * (kCap / 64) + w]));
+        return c;
+    }
 };
 
 // Reads the digits at p and moves p to the first non-digit.
@@ -127,8 +159,7 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
 }
 
 void parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
-                 uint16_t unmatched, Local& L) {
-    for (auto& v : L.names) v.reserve(static_cast<size_t>(stop - p) / 60 / L.names.size() + 16);
+                 uint16_t unmatched, Local& L, NameSet& names) {
     while (p < stop) {
         if (static_cast<uint8_t>(p[0]) == 0xEF && static_cast<uint8_t>(p[1]) == 0xBB && static_cast<uint8_t>(p[2]) == 0xBF)
             p += 3;  // byte order mark at the start of a record
@@ -161,7 +192,7 @@ void parse_range(const char* p, const char* stop, const char* end, const std::ve
         a.max = std::max(a.max, cents);
         a.name_bytes += name_len;
         a.note_bytes += note_len;
-        L.names[g].push_back(name_hash);
+        names.add(g, name_hash);
     }
 }
 
@@ -213,16 +244,15 @@ int main(int argc, char** argv) {
 
     const Mapped rec = map_file(data + "/records.csv");
     std::vector<Local> locals;
+    NameSet names;
+    names.init(groups);
     int nt = 1;
     if (rec.p) {
         const char* const base = rec.p;
         const char* const end = base + rec.n;
         nt = rec.n < (1u << 20) ? 1 : thread_count();
         locals.resize(nt);
-        for (auto& L : locals) {
-            L.agg.assign(groups, Agg());
-            L.names.resize(groups);
-        }
+        for (auto& L : locals) L.agg.assign(groups, Agg());
 
         // Pass 1: parity of the quote count in every chunk.
         std::vector<const char*> chunk(nt + 1);
@@ -260,7 +290,7 @@ int main(int argc, char** argv) {
             std::vector<std::thread> th;
             for (int i = 0; i < nt; ++i)
                 th.emplace_back([&, i] {
-                    if (starts[i] < starts[i + 1]) parse_range(starts[i], starts[i + 1], end, region_group, unmatched, locals[i]);
+                    if (starts[i] < starts[i + 1]) parse_range(starts[i], starts[i + 1], end, region_group, unmatched, locals[i], names);
                 });
             for (auto& t : th) t.join();
         }
@@ -281,34 +311,6 @@ int main(int argc, char** argv) {
             t.note_bytes += a.note_bytes;
         }
 
-    // Distinct names per group: one small open-addressing set of name hashes per group, filled
-    // from every thread's list for that group. The groups are shared out between the threads.
-    std::vector<uint64_t> distinct(groups, 0);
-    {
-        std::atomic<size_t> next_group{0};
-        std::vector<std::thread> th;
-        for (int i = 0; i < nt; ++i)
-            th.emplace_back([&] {
-                std::vector<uint64_t> set;
-                for (size_t g; (g = next_group.fetch_add(1)) < groups;) {
-                    size_t n = 0, cap = 16;
-                    for (auto& L : locals) n += L.names[g].size();
-                    while (cap < 2 * n) cap <<= 1;
-                    set.assign(cap, 0);
-                    uint64_t unique = 0;
-                    for (auto& L : locals)
-                        for (uint64_t h : L.names[g]) {
-                            h |= 1;  // 0 marks an empty slot
-                            size_t k = h & (cap - 1);
-                            while (set[k] && set[k] != h) k = (k + 1) & (cap - 1);
-                            if (!set[k]) { set[k] = h; ++unique; }
-                        }
-                    distinct[g] = unique;
-                }
-            });
-        for (auto& t : th) t.join();
-    }
-
     std::string out;
     for (size_t g = 0; g < groups; ++g) {
         const Agg& a = total[g];
@@ -325,7 +327,7 @@ int main(int argc, char** argv) {
         put_cents(out, a.min);
         out += ' ';
         put_cents(out, a.max);
-        out += ' ' + std::to_string(distinct[g]) + ' ' + std::to_string(a.name_bytes) + ' ' + std::to_string(a.note_bytes) + '\n';
+        out += ' ' + std::to_string(names.distinct(g)) + ' ' + std::to_string(a.name_bytes) + ' ' + std::to_string(a.note_bytes) + '\n';
     }
     FILE* f = fopen((outdir + "/aggregates.txt").c_str(), "wb");
     if (!f) return 1;
