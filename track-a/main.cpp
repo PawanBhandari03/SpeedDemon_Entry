@@ -84,7 +84,10 @@ struct EpTable {
                 names.emplace_back(p, n);
                 return static_cast<uint16_t>(s.id);
             }
-            if (s.h == h && s.len == n && memcmp(s.p, p, n) == 0) return static_cast<uint16_t>(s.id);
+            // The full 64-bit hash (seeded with the length) decides: comparing the bytes costs a cold load
+            // from the first occurrence of the endpoint in the file, and two of the ~2000 endpoints
+            // colliding has a chance of about 1e-13.
+            if (s.h == h && s.len == n) return static_cast<uint16_t>(s.id);
         }
     }
 };
