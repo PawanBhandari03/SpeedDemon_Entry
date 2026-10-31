@@ -788,5 +788,5 @@ int main(int argc, char** argv) {
     if (!f) return 1;
     fwrite(out.data(), 1, out.size(), f);
     fclose(f);
-    return 0;
+    _exit(0);  // the output is closed: skip the destructors, the kernel frees the memory in one go
 }

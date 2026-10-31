@@ -590,5 +590,5 @@ int main(int argc, char** argv) {
         }
     });
     fclose(f);
-    return 0;
+    _exit(0);  // the output is closed: skip the destructors, the kernel frees the memory in one go
 }
