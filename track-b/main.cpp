@@ -326,6 +326,9 @@ int main(int argc, char** argv) {
     });
     uint64_t sample_docs = 0;
     for (uint32_t s : sampled) sample_docs += s;
+    // The sample pass is the only user of the per-worker last array (pass 1 dedupes through its
+    // own term state), so its 4 bytes per term per worker go back before the big pass starts.
+    for (auto& w : workers) std::vector<uint32_t>().swap(w.last);
     std::vector<int32_t> dense_of(Q, -1);
     std::vector<uint64_t> est(Q, 0);  // sampled document count per term
     uint32_t dense_count = 0;
@@ -364,7 +367,6 @@ int main(int argc, char** argv) {
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
         std::fill(w.count.begin(), w.count.end(), 0);
-        std::fill(w.last.begin(), w.last.end(), UINT32_MAX);
         // The dense terms' bits of the 64 documents in progress: one word per term, which stays
         // in the L1 cache, written to the big bitsets once per 64 documents. Setting a bit straight
         // in the bitsets is a cache and TLB miss per (document, dense term), because the bitsets
