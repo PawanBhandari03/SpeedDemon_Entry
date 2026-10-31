@@ -80,6 +80,23 @@ struct Agg {
 struct Local {
     std::vector<Agg> agg;
     std::string scratch;
+    // region id -> group, with the hot ids kept by a small direct-mapped cache: region popularity
+    // is skewed, so a cache this size answers a good share of the lookups without touching the
+    // 2 MB table. Id 0 is a free line, and region ids start at 1.
+    struct Line {
+        uint32_t id = 0;
+        uint16_t g = 0;
+        uint16_t pad = 0;
+    } rc[1024] = {};
+    const std::vector<uint16_t>* region_group = nullptr;
+    uint16_t group_of(uint32_t r) {
+        Line& c = rc[r & 1023];
+        if (c.id != r) {
+            c.id = r;
+            c.g = r < region_group->size() ? (*region_group)[r] : kNoGroup;
+        }
+        return c.g;
+    }
 };
 
 // Distinct names. The spec draws names from a pool of 100,000 values, so every distinct name
@@ -90,8 +107,14 @@ struct NameSet {
     static constexpr size_t kCap = size_t(1) << 18;      // table slots
     static constexpr size_t kMaxNames = size_t(1) << 17;  // ids; the table is half empty at most
     static constexpr size_t kWords = kMaxNames / 64;
-    uint64_t* keys = static_cast<uint64_t*>(calloc(kCap, sizeof(uint64_t)));
-    uint32_t* ids = static_cast<uint32_t*>(calloc(kCap, sizeof(uint32_t)));  // id + 1 once published
+    // One 16-byte slot holds both the key and the id, so a probe touches one cache line instead of
+    // two arrays 2 MB apart. `id` is 0 until the thread that inserted the key has published it.
+    struct Slot {
+        uint64_t h;
+        uint32_t id;
+        uint32_t pad;
+    };
+    Slot* slots = static_cast<Slot*>(calloc(kCap, sizeof(Slot)));
     std::atomic<uint32_t> next{0};
     std::atomic<bool> overflow{false};
     uint64_t* bits = nullptr;  // groups x kMaxNames bits
@@ -101,22 +124,22 @@ struct NameSet {
     uint32_t id_of(uint64_t h) {
         h |= 1;  // 0 marks an empty slot
         for (size_t i = h & (kCap - 1);; i = (i + 1) & (kCap - 1)) {
-            std::atomic_ref<uint64_t> key(keys[i]);
+            std::atomic_ref<uint64_t> key(slots[i].h);
             uint64_t cur = key.load(std::memory_order_relaxed);
             if (cur == 0 && key.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
                 const uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
-                std::atomic_ref<uint32_t>(ids[i]).store(id + 1, std::memory_order_release);
+                std::atomic_ref<uint32_t>(slots[i].id).store(id + 1, std::memory_order_release);
                 return id;
             }
             if (cur == h) {  // the key may have been stored just now by another thread: wait for its id
-                std::atomic_ref<uint32_t> published(ids[i]);
+                std::atomic_ref<uint32_t> published(slots[i].id);
                 uint32_t v;
                 while (!(v = published.load(std::memory_order_acquire))) {}
                 return v - 1;
             }
         }
     }
-    void prefetch_slot(uint64_t h) const { __builtin_prefetch(&keys[(h | 1) & (kCap - 1)]); }
+    void prefetch_slot(uint64_t h) const { __builtin_prefetch(&slots[(h | 1) & (kCap - 1)].h); }
     void prefetch_bit(size_t group, uint32_t id) const { __builtin_prefetch(&bits[group * kWords + (id < kMaxNames ? id : 0) / 64]); }
     void set(size_t group, uint32_t id) {
         if (id >= kMaxNames) { overflow.store(true, std::memory_order_relaxed); id = 0; }
@@ -126,8 +149,7 @@ struct NameSet {
             std::atomic_ref<uint64_t>(w).fetch_or(bit, std::memory_order_relaxed);
     }
     void reset(size_t groups) {
-        memset(keys, 0, kCap * sizeof(uint64_t));
-        memset(ids, 0, kCap * sizeof(uint32_t));
+        memset(slots, 0, kCap * sizeof(Slot));
         memset(bits, 0, groups * kWords * sizeof(uint64_t));
         next.store(0);
     }
@@ -181,8 +203,8 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     *hash = hash_bytes(L.scratch.data(), L.scratch.size());
 }
 
-const char* parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
-                        uint16_t unmatched, Local& L, NameSet& names) {
+const char* parse_range(const char* p, const char* stop, const char* end, uint16_t unmatched, Local& L,
+                        NameSet& names) {
     // The names of 16 records are added together: the table slots and the bitset words are cache
     // misses, and issuing all the prefetches first lets them overlap instead of stalling one by one.
     constexpr int kBatch = 16;
@@ -221,7 +243,7 @@ const char* parse_range(const char* p, const char* stop, const char* end, const 
         if (p < end && *p == '\n') ++p;
         const int64_t cents = neg ? -static_cast<int64_t>(whole * 100 + frac) : static_cast<int64_t>(whole * 100 + frac);
 
-        uint16_t g = region < region_group.size() ? region_group[region] : kNoGroup;
+        uint16_t g = L.group_of(static_cast<uint32_t>(region));
         if (g == kNoGroup) g = unmatched;
         Agg& a = L.agg[g];
         ++a.count;
@@ -295,7 +317,7 @@ int main(int argc, char** argv) {
         const char* const end = base + rec.n;
         nt = rec.n < (1u << 20) ? 1 : thread_count();
         locals.resize(nt);
-        for (auto& L : locals) L.agg.assign(groups, Agg());
+        for (auto& L : locals) { L.agg.assign(groups, Agg()); L.region_group = &region_group; }
 
         std::vector<const char*> chunk(nt + 1);
         for (int i = 0; i <= nt; ++i) chunk[i] = base + rec.n * static_cast<size_t>(i) / static_cast<size_t>(nt);
@@ -309,7 +331,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < nt; ++i)
                 th.emplace_back([&, i] {
                     ends[i] = starts[i] < starts[i + 1]
-                                  ? parse_range(starts[i], starts[i + 1], end, region_group, unmatched, locals[i], names)
+                                  ? parse_range(starts[i], starts[i + 1], end, unmatched, locals[i], names)
                                   : starts[i];
                 });
             for (auto& t : th) t.join();
