@@ -98,12 +98,12 @@ inline uint64_t hash_bytes_padded(const char* p, size_t n) {
 // memchr for one byte, 16 bytes at a time; the quoted fields of a record are short, where the call
 // into libc costs more than the scan.
 inline const char* find_quote(const char* p, const char* end) {
-    const __m128i q = _mm_set1_epi8('"');
-    while (p + 16 <= end) {
+    const __m256i q = _mm256_set1_epi8('"');
+    while (p + 32 <= end) {
         const unsigned m = static_cast<unsigned>(
-            _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), q)));
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), q)));
         if (m) return p + __builtin_ctz(m);
-        p += 16;
+        p += 32;
     }
     return static_cast<const char*>(memchr(p, '"', static_cast<size_t>(end - p)));
 }
@@ -219,6 +219,39 @@ inline uint64_t read_digits(const char*& p) {
     return v;
 }
 
+// Parses "region,amount" (region up to 7 digits, amount -?0..99999.99, always two decimals) at p and
+// returns the pointer just past the two-digit fraction. One 16-byte load finds the comma, which ends
+// the region, and the decimal point, which ends the whole part; each number is converted with the
+// three-multiply trick. The caller has already checked that the record is well formed.
+inline const char* read_region_amount(const char* p, uint64_t& region, int64_t& cents) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    uint64_t x = w ^ 0x3030303030303030ull;
+    uint64_t bad = ((x + 0x7676767676767676ull) | x) & 0x8080808080808080ull;
+    const unsigned rn = static_cast<unsigned>(__builtin_ctzll(bad)) / 8;  // region digits
+    region = ((w << ((8 - rn) * 8)) & 0x0F0F0F0F0F0F0F0Full);
+    region = ((region * 2561) >> 8);
+    region = ((region & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
+    region = ((region & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
+    p += rn + 1;                                     // past the comma
+    const bool neg = *p == '-';
+    p += neg;
+    memcpy(&w, p, 8);
+    x = w ^ 0x3030303030303030ull;
+    bad = ((x + 0x7676767676767676ull) | x) & 0x8080808080808080ull;
+    const unsigned wn = static_cast<unsigned>(__builtin_ctzll(bad)) / 8;  // whole digits
+    uint64_t whole = ((w << ((8 - wn) * 8)) & 0x0F0F0F0F0F0F0F0Full);
+    whole = ((whole * 2561) >> 8);
+    whole = ((whole & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
+    whole = ((whole & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
+    const uint64_t frac = static_cast<uint64_t>(p[wn + 1] - '0') * 10 + static_cast<uint64_t>(p[wn + 2] - '0');
+    p += wn + 3;
+    if (*p == '\r') ++p;
+    if (*p == '\n') ++p;
+    const uint64_t v = whole * 100 + frac;
+    cents = neg ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+    return p;
+}
 // Scans one text field starting at p. Sets the unescaped length (and the hash of the unescaped
 // value when hash is not null) and moves p past the field, to the ',' after it. A quoted field
 // ends at the first '"' that is not part of a "" pair.
@@ -284,19 +317,13 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
         ++p;
         scan_text(p, end, L, note_len, nullptr);  // only the note's length matters
         ++p;
-        const uint64_t region = read_digits(p);
-        ++p;
-        // The region's group is a random probe into a 2 MB table; issue it now so the amount below
-        // covers part of its latency.
+        // "region,amount" is one short run of digits at the end of the record: one 16-byte load finds
+        // the comma and the decimal point, and both numbers come out of the same masks.
+        uint64_t region;
+        int64_t cents;
+        p = read_region_amount(p, region, cents);
+        // The region's group is a random probe into a 2 MB table.
         if (region < L.region_group->size()) __builtin_prefetch(&(*L.region_group)[region]);
-        const bool neg = *p == '-';
-        p += neg;
-        const uint64_t whole = read_digits(p);
-        const uint64_t frac = static_cast<uint64_t>(p[1] - '0') * 10 + static_cast<uint64_t>(p[2] - '0');
-        p += 3;
-        if (*p == '\r') ++p;
-        if (p < end && *p == '\n') ++p;
-        const int64_t cents = neg ? -static_cast<int64_t>(whole * 100 + frac) : static_cast<int64_t>(whole * 100 + frac);
 
         uint8_t g = L.group_of(static_cast<uint32_t>(region));
         if (g == kNoGroup) g = unmatched;
