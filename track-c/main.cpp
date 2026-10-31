@@ -255,7 +255,7 @@ inline const char* read_region_amount(const char* p, const char* end, uint64_t& 
 // Scans one text field starting at p. Sets the unescaped length (and the hash of the unescaped
 // value when hash is not null) and moves p past the field, to the ',' after it. A quoted field
 // ends at the first '"' that is not part of a "" pair.
-inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, uint64_t* hash) {
+inline void scan_text(const char*& p, const char* end, size_t& len, uint64_t* hash) {
     if (*p != '"') {
         const char* s = p;
         while (*p != ',') ++p;
@@ -333,9 +333,9 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
         ++p;
         size_t name_len, note_len;
         uint64_t name_hash;
-        scan_text(p, end, L, name_len, &name_hash);
+        scan_text(p, end, name_len, &name_hash);
         ++p;
-        scan_text(p, end, L, note_len, nullptr);  // only the note's length matters
+        scan_text(p, end, note_len, nullptr);  // only the note's length matters
         ++p;
         // "region,amount" is one short run of digits at the end of the record: one 16-byte load finds
         // the comma and the decimal point, and both numbers come out of the same masks.
