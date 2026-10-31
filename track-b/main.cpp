@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
     dict.init(Q);
     for (uint32_t i = 0; i < Q; ++i) dict.insert(keys[i], i);
     std::vector<uint32_t> qid(qterm.size());
-    for (size_t i = 0; i < qterm.size(); ++i) qid[i] = static_cast<uint32_t>(std::lower_bound(keys.begin(), keys.end(), qterm[i]) - keys.begin());
+    for (size_t i = 0; i < qterm.size(); ++i) qid[i] = dict.find(qterm[i]);  // the id of a key is its place in keys
 
     // ---- Corpus: number of documents from the last line's id.
     const char* const dbase = docs.p;
