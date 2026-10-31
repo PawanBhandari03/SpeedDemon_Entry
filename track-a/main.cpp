@@ -172,12 +172,6 @@ struct Worker {
 
 };
 
-// Index of the first space byte in the 8 bytes w, or 8 if there is none.
-inline unsigned space_in(uint64_t w) {
-    const uint64_t x = w ^ 0x2020202020202020ull;
-    const uint64_t t = (x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull;
-    return t ? static_cast<unsigned>(__builtin_ctzll(t)) / 8 : 8;
-}
 
 // Splits "METHOD ENDPOINT STATUS LATENCY<LF>" at q, which has at least 64 readable bytes, with
 // two 32-byte compares instead of byte loops: the bits of the space and LF masks give the field
@@ -245,18 +239,13 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
         uint32_t lat;
         const char* next = e - q >= 64 ? fast_fields(q, ep, ep_len, err, lat) : nullptr;
         if (!next) {
+            // A line whose endpoint runs past the 64-byte window: the same fields, found with memchr
+            // (which is vectorised in libc anyway) instead of the two AVX2 compares.
             while (*q != ' ') ++q;
-            ep = ++q;                   // endpoint, scanned 8 bytes at a time
-            for (;;) {
-                if (e - q < 8) { while (*q != ' ') ++q; break; }
-                uint64_t word;
-                memcpy(&word, q, 8);
-                const unsigned k = space_in(word);
-                q += k;
-                if (k < 8) break;
-            }
-            ep_len = static_cast<size_t>(q - ep);
-            ++q;
+            ep = ++q;
+            const char* sp = static_cast<const char*>(memchr(q, ' ', static_cast<size_t>(e - q)));
+            ep_len = static_cast<size_t>(sp - q);
+            q = sp + 1;
             err = (*q == '5');          // status is always three digits
             q += 4;
             lat = 0;
