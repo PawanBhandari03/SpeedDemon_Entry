@@ -83,38 +83,56 @@ struct Local {
 };
 
 // Distinct names. The spec draws names from a pool of 100,000 values, so every distinct name
-// gets a slot in one table shared by all threads (compare-and-swap on the key), and each group
-// keeps a bitset over the slots it has seen. Memory is a few MB instead of one hash per record.
+// gets a dense id from one table shared by all threads (compare-and-swap on the key), and each
+// group keeps a bitset over the ids it has seen. Memory is a few MB instead of one hash per
+// record, and a group's bitset is small enough to stay in cache.
 struct NameSet {
-    static constexpr size_t kCap = size_t(1) << 18;
+    static constexpr size_t kCap = size_t(1) << 18;      // table slots
+    static constexpr size_t kMaxNames = size_t(1) << 17;  // ids; the table is half empty at most
+    static constexpr size_t kWords = kMaxNames / 64;
     uint64_t* keys = static_cast<uint64_t*>(calloc(kCap, sizeof(uint64_t)));
-    uint64_t* bits = nullptr;  // groups x kCap bits
+    uint32_t* ids = static_cast<uint32_t*>(calloc(kCap, sizeof(uint32_t)));  // id + 1 once published
+    std::atomic<uint32_t> next{0};
+    std::atomic<bool> overflow{false};
+    uint64_t* bits = nullptr;  // groups x kMaxNames bits
 
-    void init(size_t groups) { bits = static_cast<uint64_t*>(calloc(groups * (kCap / 64), sizeof(uint64_t))); }
+    void init(size_t groups) { bits = static_cast<uint64_t*>(calloc(groups * kWords, sizeof(uint64_t))); }
 
-    size_t slot_of(uint64_t h) {
+    uint32_t id_of(uint64_t h) {
         h |= 1;  // 0 marks an empty slot
         for (size_t i = h & (kCap - 1);; i = (i + 1) & (kCap - 1)) {
             std::atomic_ref<uint64_t> key(keys[i]);
             uint64_t cur = key.load(std::memory_order_relaxed);
-            if (cur == 0 && key.compare_exchange_strong(cur, h, std::memory_order_relaxed)) return i;
-            if (cur == h) return i;  // also when another thread just stored this same key
+            if (cur == 0 && key.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
+                const uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
+                std::atomic_ref<uint32_t>(ids[i]).store(id + 1, std::memory_order_release);
+                return id;
+            }
+            if (cur == h) {  // the key may have been stored just now by another thread: wait for its id
+                std::atomic_ref<uint32_t> published(ids[i]);
+                uint32_t v;
+                while (!(v = published.load(std::memory_order_acquire))) {}
+                return v - 1;
+            }
         }
     }
     void add(size_t group, uint64_t h) {
-        const size_t s = slot_of(h);
-        uint64_t& w = bits[group * (kCap / 64) + s / 64];
-        const uint64_t bit = 1ull << (s % 64);
+        uint32_t id = id_of(h);
+        if (id >= kMaxNames) { overflow.store(true, std::memory_order_relaxed); id = 0; }
+        uint64_t& w = bits[group * kWords + id / 64];
+        const uint64_t bit = 1ull << (id % 64);
         if (!(std::atomic_ref<uint64_t>(w).load(std::memory_order_relaxed) & bit))
             std::atomic_ref<uint64_t>(w).fetch_or(bit, std::memory_order_relaxed);
     }
     void reset(size_t groups) {
         memset(keys, 0, kCap * sizeof(uint64_t));
-        memset(bits, 0, groups * (kCap / 64) * sizeof(uint64_t));
+        memset(ids, 0, kCap * sizeof(uint32_t));
+        memset(bits, 0, groups * kWords * sizeof(uint64_t));
+        next.store(0);
     }
     uint64_t distinct(size_t group) const {
         uint64_t c = 0;
-        for (size_t w = 0; w < kCap / 64; ++w) c += static_cast<uint64_t>(__builtin_popcountll(bits[group * (kCap / 64) + w]));
+        for (size_t w = 0; w < kWords; ++w) c += static_cast<uint64_t>(__builtin_popcountll(bits[group * kWords + w]));
         return c;
     }
 };
@@ -323,6 +341,8 @@ int main(int argc, char** argv) {
             parse_all(starts);
         }
     }
+
+    if (names.overflow.load()) return 1;  // more distinct names than the spec allows
 
     // Add up the per-thread sums.
     std::vector<Agg> total(groups);
