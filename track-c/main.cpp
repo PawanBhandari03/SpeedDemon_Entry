@@ -116,8 +116,9 @@ struct NameSet {
             }
         }
     }
-    void add(size_t group, uint64_t h) {
-        uint32_t id = id_of(h);
+    void prefetch_slot(uint64_t h) const { __builtin_prefetch(&keys[(h | 1) & (kCap - 1)]); }
+    void prefetch_bit(size_t group, uint32_t id) const { __builtin_prefetch(&bits[group * kWords + (id < kMaxNames ? id : 0) / 64]); }
+    void set(size_t group, uint32_t id) {
         if (id >= kMaxNames) { overflow.store(true, std::memory_order_relaxed); id = 0; }
         uint64_t& w = bits[group * kWords + id / 64];
         const uint64_t bit = 1ull << (id % 64);
@@ -182,6 +183,22 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
 
 const char* parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
                         uint16_t unmatched, Local& L, NameSet& names) {
+    // The names of 16 records are added together: the table slots and the bitset words are cache
+    // misses, and issuing all the prefetches first lets them overlap instead of stalling one by one.
+    constexpr int kBatch = 16;
+    uint64_t batch_hash[kBatch];
+    uint32_t batch_id[kBatch];
+    uint16_t batch_group[kBatch];
+    int batched = 0;
+    auto flush = [&] {
+        for (int k = 0; k < batched; ++k) names.prefetch_slot(batch_hash[k]);
+        for (int k = 0; k < batched; ++k) {
+            batch_id[k] = names.id_of(batch_hash[k]);
+            names.prefetch_bit(batch_group[k], batch_id[k]);
+        }
+        for (int k = 0; k < batched; ++k) names.set(batch_group[k], batch_id[k]);
+        batched = 0;
+    };
     while (p < stop) {
         if (static_cast<uint8_t>(p[0]) == 0xEF && static_cast<uint8_t>(p[1]) == 0xBB && static_cast<uint8_t>(p[2]) == 0xBF)
             p += 3;  // byte order mark at the start of a record
@@ -214,8 +231,11 @@ const char* parse_range(const char* p, const char* stop, const char* end, const 
         a.max = std::max(a.max, cents);
         a.name_bytes += name_len;
         a.note_bytes += note_len;
-        names.add(g, name_hash);
+        batch_hash[batched] = name_hash;
+        batch_group[batched] = g;
+        if (++batched == kBatch) flush();
     }
+    flush();
     return p;
 }
 
