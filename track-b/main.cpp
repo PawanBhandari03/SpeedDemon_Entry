@@ -207,18 +207,93 @@ struct Dict {
     }
 };
 
+// A table of query terms for the scan, in buckets of four keys that are compared with one AVX2
+// instruction: a probe is one load and one compare, with no loop and no branch that depends on the
+// word, which is what the scan needs (about a third of the words are query terms, and that is a coin
+// flip for a branch predictor). The value is the term id, with the top bit set for a phrase driver.
+// Keys are never 0 (token_key). A full bucket without the key sends the probe to the next bucket,
+// which is rare and predictable at this load.
+struct BucketDict {
+    static constexpr uint32_t kNone = UINT32_MAX;
+    uint64_t* keys = nullptr;
+    uint32_t* ids = nullptr;
+    size_t mask = 0;  // buckets - 1
+
+    BucketDict() = default;
+    BucketDict(const BucketDict&) = delete;
+    BucketDict& operator=(const BucketDict&) = delete;
+    ~BucketDict() {
+        free(keys);
+        free(ids);
+    }
+
+    void build(const std::vector<uint64_t>& all_keys, const std::vector<int32_t>& dense_of, const std::vector<uint8_t>& positional) {
+        size_t n = 0;
+        for (size_t t = 0; t < all_keys.size(); ++t) n += dense_of[t] < 0;
+        size_t buckets = 16;
+        while (buckets * 4 < n * 3) buckets <<= 1;
+        mask = buckets - 1;
+        keys = static_cast<uint64_t*>(aligned_alloc(32, buckets * 32));
+        ids = static_cast<uint32_t*>(aligned_alloc(32, buckets * 16));
+        memset(keys, 0, buckets * 32);
+        memset(ids, 0, buckets * 16);
+        for (size_t t = 0; t < all_keys.size(); ++t) {
+            if (dense_of[t] >= 0) continue;
+            size_t b = all_keys[t] & mask;
+            for (;; b = (b + 1) & mask) {
+                size_t slot = 0;
+                while (slot < 4 && keys[b * 4 + slot]) ++slot;
+                if (slot < 4) {
+                    keys[b * 4 + slot] = all_keys[t];
+                    ids[b * 4 + slot] = static_cast<uint32_t>(t) | (positional[t] ? 0x80000000u : 0u);
+                    break;
+                }
+            }
+        }
+    }
+
+    inline void prefetch(uint64_t key) const {
+        __builtin_prefetch(keys + (key & mask) * 4);
+        __builtin_prefetch(ids + (key & mask) * 4);
+    }
+
+    inline uint32_t find(uint64_t key) const {
+        size_t b = key & mask;
+        for (;;) {
+            const __m256i bucket = _mm256_load_si256(reinterpret_cast<const __m256i*>(keys + b * 4));
+            const unsigned found = static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(
+                _mm256_cmpeq_epi64(bucket, _mm256_set1_epi64x(static_cast<long long>(key))))));
+            const unsigned empty = static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(
+                _mm256_cmpeq_epi64(bucket, _mm256_setzero_si256()))));
+            const uint32_t v = ids[b * 4 + (static_cast<unsigned>(__builtin_ctz(found | 16)) & 3)];
+            if (__builtin_expect((found | empty) != 0, 1)) {
+                const uint32_t hit = 0u - static_cast<uint32_t>(found != 0);  // all ones on a hit
+                return (v & hit) | (kNone & ~hit);
+            }
+            b = (b + 1) & mask;
+        }
+    }
+};
+
 // The term streams are split by term id (term % kGroups), so the posting lists can be built, and the
 // streams freed, one group at a time: only one group's postings exist next to the remaining streams.
 constexpr unsigned kGroups = 4;
 
 struct Worker {
-    std::vector<uint16_t> terms[kGroups];    // rare terms (term / kGroups), once per document, in document order
+    uint16_t* terms[kGroups] = {};           // rare terms (term / kGroups), once per document, in document order (malloc)
     std::vector<uint32_t> doc_end[kGroups];  // per document of this worker: end of its run in terms
     uint32_t first_doc = 0;
     std::vector<uint64_t> occ[kGroups];      // (term << 32) | doc for every occurrence of a phrase-driver term
     std::vector<uint32_t> offs[kGroups];     // file offset of each of those occurrences
     std::vector<uint32_t> count;    // list entries per term seen by this worker
     std::vector<uint32_t> last;     // last document seen for each term, to record a document once
+
+    Worker() = default;
+    Worker(const Worker&) = delete;
+    Worker& operator=(const Worker&) = delete;
+    ~Worker() {
+        for (uint16_t* t : terms) free(t);
+    }
 };
 
 struct TermSet {
@@ -384,20 +459,34 @@ int main(int argc, char** argv) {
     }
 
     // The dense terms are the common words: they make up most corpus tokens. They get their own
-    // tiny table (a few KB, so it stays in the L1 cache) that is checked first, and a per-worker
-    // "last document" array indexed by dense number, so a common token touches only L1-sized data.
-    size_t hot_cap = 16;
-    while (hot_cap < size_t(dense_count) * 2) hot_cap <<= 1;
-    std::vector<uint64_t> hot_keys(hot_cap, 0);
-    std::vector<uint32_t> hot_dense(hot_cap, 0);
-    for (uint32_t t = 0; t < Q; ++t) {
-        if (dense_of[t] < 0) continue;
-        size_t s = keys[t] & (hot_cap - 1);
-        while (hot_keys[s]) s = (s + 1) & (hot_cap - 1);
-        hot_keys[s] = keys[t];
-        hot_dense[s] = static_cast<uint32_t>(dense_of[t]);
+    // small table (a few KB, so it stays in the L1 cache) in buckets of four keys that one compare
+    // checks, with no probe loop. It is built so that no bucket overflows, and every bucket has a
+    // fifth value, the dummy dense number, which a word that is not dense reads and writes to: that
+    // way the scan sets the bit of a common word without a branch.
+    size_t hot_buckets = 8;
+    std::vector<uint64_t> hot_keys;
+    std::vector<uint32_t> hot_val;
+    for (bool ok = false; !ok; hot_buckets <<= 1) {
+        ok = true;
+        hot_keys.assign(hot_buckets * 4, 0);
+        hot_val.assign(hot_buckets * 8, dense_count);  // slot 4 of every bucket stays the dummy
+        for (uint32_t t = 0; t < Q && ok; ++t) {
+            if (dense_of[t] < 0) continue;
+            const size_t bkt = keys[t] & (hot_buckets - 1);
+            size_t slot = 0;
+            while (slot < 4 && hot_keys[bkt * 4 + slot]) ++slot;
+            if (slot == 4) { ok = false; break; }
+            hot_keys[bkt * 4 + slot] = keys[t];
+            hot_val[bkt * 8 + slot] = static_cast<uint32_t>(dense_of[t]);
+        }
     }
-    const size_t hot_mask = hot_cap - 1;
+    hot_buckets >>= 1;  // the loop doubled once more after the successful build
+    uint64_t* hot_k = static_cast<uint64_t*>(aligned_alloc(32, hot_buckets * 32));
+    memcpy(hot_k, hot_keys.data(), hot_buckets * 32);
+    const uint32_t* const hot_v = hot_val.data();
+    const size_t hot_bmask = hot_buckets - 1;
+    BucketDict bdict;
+    bdict.build(keys, dense_of, positional);
     // ---- Pass 1: find the query terms in every document.
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
@@ -407,7 +496,7 @@ int main(int argc, char** argv) {
         // in the bitsets is a cache and TLB miss per (document, dense term), because the bitsets
         // of two terms are W words apart. A chunk starts at a multiple of 64, so this thread owns
         // every word it writes.
-        std::vector<uint64_t> block(dense_count, 0);
+        std::vector<uint64_t> block(static_cast<size_t>(dense_count) + 1, 0);  // the last word is the dummy of non-dense words
         uint32_t block_no = 0;
         auto flush_block = [&] {
             for (uint32_t d = 0; d < dense_count; ++d)
@@ -420,10 +509,23 @@ int main(int argc, char** argv) {
         std::vector<TermState> st(Q, TermState{UINT32_MAX, 0});
         const char* p = cut[i];
         const char* const e = std::max(cut[i], cut[i + 1]);
-        // Entry density measured on the full corpus: about one recorded (term, document) pair per 92
-        // input bytes per group, so this reservation is a little generous and the streams do not
-        // reallocate (each reallocation copies the stream and briefly holds two of them).
-        for (auto& v : w.terms) v.reserve(static_cast<size_t>(e - p) / 80 + 64);
+        // The streams are raw buffers that grow by doubling. Entry density measured on the full corpus:
+        // about one recorded (term, document) pair per 92 input bytes per group, so this first size is a
+        // little generous and the streams do not grow (a growth copies the stream and briefly holds two
+        // of them). Pages that are never written are never resident.
+        uint16_t* tp[kGroups];
+        size_t tn[kGroups], tcap[kGroups];
+        for (unsigned g = 0; g < kGroups; ++g) {
+            tn[g] = 0;
+            tcap[g] = static_cast<size_t>(e - p) / 80 + 4096;
+            tp[g] = static_cast<uint16_t*>(malloc(tcap[g] * sizeof(uint16_t)));
+        }
+        // One document at a time, in four steps over arrays: tokenize; find the common words (one
+        // compare each, and their bit is set without a branch); look the other words up in the big
+        // table with all the prefetches issued first; record the hits.
+        std::vector<uint64_t> tk;
+        std::vector<const char*> ta;
+        std::vector<uint32_t> cand, cv, hits;
         bool first = true;
         while (p < e) {
             uint32_t doc = 0;
@@ -431,27 +533,58 @@ int main(int argc, char** argv) {
             if (first) { w.first_doc = doc; block_no = doc >> 6; first = false; }
             if ((doc >> 6) != block_no) { flush_block(); block_no = doc >> 6; }
             doc_off[doc] = static_cast<uint32_t>(p - dbase);
+            tk.clear();
+            ta.clear();
             p = tokenize_line(p, dend, [&](uint64_t key, const char* at) {
-                for (size_t s = key & hot_mask; hot_keys[s]; s = (s + 1) & hot_mask) {
-                    if (hot_keys[s] != key) continue;
-                    block[hot_dense[s]] |= 1ull << (doc & 63);
-                    return;
+                tk.push_back(key);
+                ta.push_back(at);
+            });
+            const size_t n = tk.size();
+            if (cand.size() < n + 1) { cand.resize(n + 1); cv.resize(n + 1); hits.resize(n + 1); }
+            const uint64_t bit = 1ull << (doc & 63);
+            size_t nc = 0;
+            for (size_t k = 0; k < n; ++k) {
+                const uint64_t key = tk[k];
+                const size_t bkt = key & hot_bmask;
+                const unsigned m = static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(hot_k + bkt * 4)), _mm256_set1_epi64x(static_cast<long long>(key))))));
+                block[hot_v[bkt * 8 + static_cast<unsigned>(__builtin_ctz(m | 16))]] |= bit;
+                cand[nc] = static_cast<uint32_t>(k);
+                nc += m == 0;
+            }
+            for (size_t j = 0; j < nc; ++j) bdict.prefetch(tk[cand[j]]);
+            size_t nh = 0;
+            for (size_t j = 0; j < nc; ++j) {
+                const uint32_t v = bdict.find(tk[cand[j]]);
+                cv[j] = v;
+                hits[nh] = static_cast<uint32_t>(j);
+                nh += v != BucketDict::kNone;
+            }
+            for (unsigned g = 0; g < kGroups; ++g)
+                if (tn[g] + nh + 1 > tcap[g]) {
+                    tcap[g] = tcap[g] * 2 + nh;
+                    tp[g] = static_cast<uint16_t*>(realloc(tp[g], tcap[g] * sizeof(uint16_t)));
                 }
-                const uint32_t t = dict.find(key);
-                if (t == UINT32_MAX) return;
-                if (positional[t]) {
+            for (size_t h = 0; h < nh; ++h) {
+                const uint32_t v = cv[hits[h]];
+                const uint32_t t = v & 0x7FFFFFFFu;
+                if (v >> 31) {  // a phrase driver: every occurrence, with its offset
                     ++st[t].count;
                     w.occ[t % kGroups].push_back((static_cast<uint64_t>(t) << 32) | doc);
-                    w.offs[t % kGroups].push_back(static_cast<uint32_t>(at - dbase));
-                    return;
+                    w.offs[t % kGroups].push_back(static_cast<uint32_t>(ta[cand[hits[h]]] - dbase));
+                    continue;
                 }
-                if (st[t].last == doc) return;
-                st[t].last = doc;
-                ++st[t].count;
-                w.terms[t % kGroups].push_back(static_cast<uint16_t>(t / kGroups));
-            });
-            for (unsigned g = 0; g < kGroups; ++g) w.doc_end[g].push_back(static_cast<uint32_t>(w.terms[g].size()));
+                TermState& ts = st[t];
+                const uint32_t fresh = ts.last != doc;  // the first time this document has the term
+                ts.last = doc;
+                ts.count += fresh;
+                const unsigned g = t % kGroups;
+                tp[g][tn[g]] = static_cast<uint16_t>(t / kGroups);
+                tn[g] += fresh;
+            }
+            for (unsigned g = 0; g < kGroups; ++g) w.doc_end[g].push_back(static_cast<uint32_t>(tn[g]));
         }
+        for (unsigned g = 0; g < kGroups; ++g) w.terms[g] = tp[g];
         if (!first) flush_block();
         for (uint32_t t = 0; t < Q; ++t) w.count[t] = st[t].count;
     });
@@ -488,7 +621,8 @@ int main(int argc, char** argv) {
                 postings[g][at] = static_cast<uint32_t>(w.occ[g][j]);
                 post_off[g][at] = w.offs[g][j];
             }
-            std::vector<uint16_t>().swap(w.terms[g]);
+            free(w.terms[g]);
+            w.terms[g] = nullptr;
             std::vector<uint32_t>().swap(w.doc_end[g]);
             std::vector<uint64_t>().swap(w.occ[g]);
             std::vector<uint32_t>().swap(w.offs[g]);
