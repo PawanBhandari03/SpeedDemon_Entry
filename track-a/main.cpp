@@ -170,13 +170,6 @@ struct Worker {
         c.errs += err;
     }
 
-    // The cell of (hour, local endpoint), or null when this worker saw no such record.
-    const Cell* cell(size_t hour, uint32_t local_ep) const {
-        const int s = slot_of[hour];
-        if (s < 0 || local_ep == UINT32_MAX) return nullptr;
-        const std::vector<Cell>& row = rows[static_cast<size_t>(s)];
-        return local_ep < row.size() ? &row[local_ep] : nullptr;
-    }
 };
 
 // Index of the first space byte in the 8 bytes w, or 8 if there is none.
@@ -417,22 +410,28 @@ int main(int argc, char** argv) {
             for (size_t e = 0; e < E; ++e) {
                 size_t n = 0;
                 uint64_t errs = 0;
-                bool over = false;
+                for (int i = 0; i < nt; ++i) {
+                    const uint32_t lep = local_of[i][e];
+                    if (lep >= row_len[i]) continue;
+                    n += row_of[i][lep].count;
+                    errs += row_of[i][lep].errs;
+                }
+                if (!n) continue;
+                // Grown, never shrunk: resize() would zero-fill the new elements of every group and the
+                // copy below overwrites them anyway. Eight values of slack let a whole 32-byte block be
+                // copied with one AVX2 move instead of a memcpy of its live values.
+                if (vals.size() < n + 8) vals.resize(n + 8);
+                uint32_t* v = vals.data();
+                size_t k = 0;
                 for (int i = 0; i < nt; ++i) {
                     const uint32_t lep = local_of[i][e];
                     if (lep >= row_len[i]) continue;
                     const Cell& c = row_of[i][lep];
-                    if (!c.count) continue;
-                    errs += c.errs;
-                    if (n + c.count > vals.size() - 8) { over = true; break; }
                     size_t left = c.count;
-                    size_t k = n;
-                    n += left;
                     size_t take = (left - 1) % kBlockValues + 1;  // the newest block may be partly filled
                     for (uint32_t id = c.tail; left;) {
                         const uint32_t* blk = workers[i].block(id);
-                        // A block is 32 bytes and 32-byte aligned: copy all of it, keep `take` values.
-                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(&vals[k]),
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(&v[k]),
                                             _mm256_load_si256(reinterpret_cast<const __m256i*>(blk)));
                         k += take;
                         left -= take;
@@ -440,38 +439,6 @@ int main(int argc, char** argv) {
                         take = kBlockValues;
                     }
                 }
-                if (over) {
-                    // Rare: a group larger than the buffer. Count first, then copy into an exact array.
-                    n = 0;
-                    errs = 0;
-                    for (int i = 0; i < nt; ++i) {
-                        const uint32_t lep = local_of[i][e];
-                        if (lep >= row_len[i]) continue;
-                        n += row_of[i][lep].count;
-                        errs += row_of[i][lep].errs;
-                    }
-                    if (vals.size() < n + 8) vals.resize(n + 8);
-                    size_t k = 0;
-                    for (int i = 0; i < nt; ++i) {
-                        const uint32_t lep = local_of[i][e];
-                        if (lep >= row_len[i]) continue;
-                        const Cell& c = row_of[i][lep];
-                        if (!c.count) continue;
-                        size_t left = c.count;
-                        size_t take = (left - 1) % kBlockValues + 1;
-                        for (uint32_t id = c.tail; left;) {
-                            const uint32_t* blk = workers[i].block(id);
-                            _mm256_storeu_si256(reinterpret_cast<__m256i*>(&vals[k]),
-                                                _mm256_load_si256(reinterpret_cast<const __m256i*>(blk)));
-                            k += take;
-                            left -= take;
-                            id = blk[kBlockValues];
-                            take = kBlockValues;
-                        }
-                    }
-                }
-                if (!n) continue;
-                uint32_t* v = vals.data();
                 const size_t r99 = (99 * n + 99) / 100, r95 = (95 * n + 99) / 100, r50 = (50 * n + 99) / 100;
                 if (n <= 64) {
                     // Most buckets are small: a plain sort of a few values beats three selections.
