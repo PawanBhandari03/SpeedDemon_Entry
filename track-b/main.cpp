@@ -381,7 +381,20 @@ int main(int argc, char** argv) {
         Worker& w = workers[i];
         std::fill(w.count.begin(), w.count.end(), 0);
         std::fill(w.last.begin(), w.last.end(), UINT32_MAX);
-        std::vector<uint32_t> hot_last(dense_count, UINT32_MAX);
+        // The dense terms' bits of the 64 documents in progress: one word per term, which stays
+        // in the L1 cache, written to the big bitsets once per 64 documents. Setting a bit straight
+        // in the bitsets is a cache and TLB miss per (document, dense term), because the bitsets
+        // of two terms are W words apart. A chunk starts at a multiple of 64, so this thread owns
+        // every word it writes.
+        std::vector<uint64_t> block(dense_count, 0);
+        uint32_t block_no = 0;
+        auto flush_block = [&] {
+            for (uint32_t d = 0; d < dense_count; ++d)
+                if (block[d]) {
+                    dense_bits[static_cast<size_t>(d) * W + block_no] = block[d];
+                    block[d] = 0;
+                }
+        };
         struct TermState { uint32_t last, count; };  // last document and entries of a rare term, in one cache line
         std::vector<TermState> st(Q, TermState{UINT32_MAX, 0});
         const char* p = cut[i];
@@ -391,16 +404,13 @@ int main(int argc, char** argv) {
         while (p < e) {
             uint32_t doc = 0;
             for (const char* x = p; *x != '\t'; ++x) doc = doc * 10 + static_cast<uint32_t>(*x - '0');
-            if (first) { w.first_doc = doc; first = false; }
+            if (first) { w.first_doc = doc; block_no = doc >> 6; first = false; }
+            if ((doc >> 6) != block_no) { flush_block(); block_no = doc >> 6; }
             doc_off[doc] = static_cast<uint32_t>(p - dbase);
             p = tokenize_line(p, dend, [&](uint64_t key, const char* at) {
                 for (size_t s = key & hot_mask; hot_keys[s]; s = (s + 1) & hot_mask) {
                     if (hot_keys[s] != key) continue;
-                    const uint32_t d = hot_dense[s];
-                    if (hot_last[d] != doc) {
-                        hot_last[d] = doc;
-                        dense_bits[static_cast<size_t>(d) * W + (doc >> 6)] |= 1ull << (doc & 63);
-                    }
+                    block[hot_dense[s]] |= 1ull << (doc & 63);
                     return;
                 }
                 const uint32_t t = dict.find(key);
@@ -418,6 +428,7 @@ int main(int argc, char** argv) {
             });
             w.doc_end.push_back(static_cast<uint32_t>(w.terms.size()));
         }
+        if (!first) flush_block();
         for (uint32_t t = 0; t < Q; ++t) w.count[t] = st[t].count;
     });
 
