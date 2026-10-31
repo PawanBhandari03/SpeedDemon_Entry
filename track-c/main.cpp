@@ -204,37 +204,69 @@ inline uint64_t read_digits(const char*& p) {
     return v;
 }
 
-// Parses "region,amount" (region up to 7 digits, amount -?0..99999.99, always two decimals) at p and
-// returns the pointer just past the two-digit fraction. One 16-byte load finds the comma, which ends
-// the region, and the decimal point, which ends the whole part; each number is converted with the
-// three-multiply trick. The caller has already checked that the record is well formed.
-inline const char* read_region_amount(const char* p, uint64_t& region, int64_t& cents) {
-    uint64_t w;
-    memcpy(&w, p, 8);
-    uint64_t x = w ^ 0x3030303030303030ull;
-    uint64_t bad = ((x + 0x7676767676767676ull) | x) & 0x8080808080808080ull;
-    const unsigned rn = static_cast<unsigned>(__builtin_ctzll(bad)) / 8;  // region digits
-    region = ((w << ((8 - rn) * 8)) & 0x0F0F0F0F0F0F0F0Full);
-    region = ((region * 2561) >> 8);
-    region = ((region & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
-    region = ((region & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
-    p += rn + 1;                                     // past the comma
+// Slow fallback for the last record (a 16-byte load there would pass the end of the mapping) and
+// for anything outside the generator's guarantees. It is byte at a time, so it never reads ahead.
+__attribute__((noinline)) const char* read_region_amount_scalar(const char* p, uint64_t& region,
+                                                               int64_t& cents) {
+    uint64_t r = 0;
+    while (static_cast<unsigned>(*p - '0') < 10) r = r * 10 + static_cast<uint64_t>(*p++ - '0');
+    ++p;  // comma
     const bool neg = *p == '-';
     p += neg;
-    memcpy(&w, p, 8);
-    x = w ^ 0x3030303030303030ull;
-    bad = ((x + 0x7676767676767676ull) | x) & 0x8080808080808080ull;
-    const unsigned wn = static_cast<unsigned>(__builtin_ctzll(bad)) / 8;  // whole digits
-    uint64_t whole = ((w << ((8 - wn) * 8)) & 0x0F0F0F0F0F0F0F0Full);
-    whole = ((whole * 2561) >> 8);
-    whole = ((whole & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
-    whole = ((whole & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
-    const uint64_t frac = static_cast<uint64_t>(p[wn + 1] - '0') * 10 + static_cast<uint64_t>(p[wn + 2] - '0');
-    p += wn + 3;
+    uint64_t whole = 0;
+    while (static_cast<unsigned>(*p - '0') < 10) whole = whole * 10 + static_cast<uint64_t>(*p++ - '0');
+    ++p;  // dot
+    const uint64_t frac = static_cast<uint64_t>(p[0] - '0') * 10 + static_cast<uint64_t>(p[1] - '0');
+    p += 2;
     if (*p == '\r') ++p;
     if (*p == '\n') ++p;
+    region = r;
     const uint64_t v = whole * 100 + frac;
     cents = neg ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+    return p;
+}
+
+// Parses "region,amount" (region up to 7 digits, amount -?0..99999.99, always two decimals) at p and
+// returns the pointer just past the two-digit fraction. One 16-byte load marks every digit, which
+// gives the comma and the decimal point. The region and the amount's whole part are then left-aligned
+// in the two 8-byte halves of one vector: vpmaddubsw forms base-100 words, vpmaddwd forms base-10000
+// dwords, and an 8-digit field is high*10000+low. Both numbers are converted by that same pair of
+// instructions. p must have 18 readable bytes (the last record takes the scalar path).
+inline const char* read_region_amount(const char* p, const char* end, uint64_t& region, int64_t& cents) {
+    if (end - p < 18) return read_region_amount_scalar(p, region, cents);
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+    const __m128i isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    const unsigned dm = static_cast<unsigned>(_mm_movemask_epi8(isdig));
+    const unsigned rn = static_cast<unsigned>(__builtin_ctz(~dm));  // region digits, then the comma
+    if (rn < 1 || rn > 7) return read_region_amount_scalar(p, region, cents);
+    const bool neg = p[rn + 1] == '-';
+    const unsigned astart = rn + 1 + static_cast<unsigned>(neg);
+    const unsigned wn = static_cast<unsigned>(__builtin_ctz((~dm) >> astart));  // whole digits, then '.'
+    const unsigned dot = astart + wn;
+    if (wn < 1 || wn > 5 || dot > 14) return read_region_amount_scalar(p, region, cents);
+
+    uint64_t wr = static_cast<uint64_t>(_mm_cvtsi128_si64(v));  // the region's eight bytes
+    uint64_t wa;
+    memcpy(&wa, p + astart, 8);
+    wr <<= (8 - rn) * 8;  // the comma moves out of the word and digits land in the high bytes
+    wa <<= (8 - wn) * 8;
+    wr &= 0x0F0F0F0F0F0F0F0Full;  // ASCII digit -> value; the zero padding stays zero
+    wa &= 0x0F0F0F0F0F0F0F0Full;
+    const __m128i packed = _mm_set_epi64x(static_cast<long long>(wr), static_cast<long long>(wa));
+    const __m128i w16 = _mm_maddubs_epi16(packed, _mm_set1_epi16(0x010A));     // [10,1] per pair
+    const __m128i w32 = _mm_madd_epi16(w16, _mm_set1_epi32(0x00010064));       // [100,1] per dword
+    const uint32_t whole = static_cast<uint32_t>(_mm_cvtsi128_si32(w32)) * 10000u +
+                           static_cast<uint32_t>(_mm_extract_epi32(w32, 1));
+    region = static_cast<uint32_t>(_mm_extract_epi32(w32, 2)) * 10000u +
+             static_cast<uint32_t>(_mm_extract_epi32(w32, 3));
+
+    const uint64_t frac = static_cast<uint64_t>(p[dot + 1] - '0') * 10 + static_cast<uint64_t>(p[dot + 2] - '0');
+    p += dot + 3;
+    if (*p == '\r') ++p;
+    if (*p == '\n') ++p;
+    const uint64_t v64 = static_cast<uint64_t>(whole) * 100 + frac;
+    cents = neg ? -static_cast<int64_t>(v64) : static_cast<int64_t>(v64);
     return p;
 }
 // Scans one text field starting at p. Sets the unescaped length (and the hash of the unescaped
@@ -307,7 +339,7 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
         // the comma and the decimal point, and both numbers come out of the same masks.
         uint64_t region;
         int64_t cents;
-        p = read_region_amount(p, region, cents);
+        p = read_region_amount(p, end, region, cents);
         // The region's group is a random probe into a 2 MB table.
         if (region < L.region_group->size()) __builtin_prefetch(&(*L.region_group)[region]);
 
