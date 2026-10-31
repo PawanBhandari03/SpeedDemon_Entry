@@ -361,6 +361,9 @@ int main(int argc, char** argv) {
     const uint8_t unmatched = static_cast<uint8_t>(codes.size());
     std::vector<uint8_t> region_group(static_cast<size_t>(max_id) + 1, kNoGroup);
     for (auto& r : regions) region_group[r.first] = code_group[r.second];
+    // The (id, code) list was only a convenient way to build the table above: 200,000 pairs, 1.6 MB.
+    // It goes back before the records are mapped and the aggregates are allocated.
+    std::vector<std::pair<uint32_t, uint16_t>>().swap(regions);
     const size_t groups = codes.size() + 1;
 
     const Mapped rec = map_file(data + "/records.csv");
