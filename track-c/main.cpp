@@ -140,7 +140,7 @@ struct Local {
 // group keeps a bitset over the ids it has seen. Memory is a few MB instead of one hash per
 // record, and a group's bitset is small enough to stay in cache.
 struct NameSet {
-    static constexpr size_t kCap = size_t(1) << 18;      // table slots
+    static constexpr size_t kCap = size_t(1) << 17;      // table slots
     static constexpr size_t kMaxNames = size_t(1) << 17;  // ids; the table is half empty at most
     static constexpr size_t kWords = kMaxNames / 64;
     // One 16-byte slot holds both the key and the id, so a probe touches one cache line instead of
