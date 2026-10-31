@@ -1,3 +1,13 @@
+// Speed Demon 2026, Track C (Join): records.csv + regions.csv -> aggregates.txt
+//
+// Plan: a quoted field may contain a newline, so the file cannot be cut at any '\n'. Instead
+// every chunk first counts its '"' bytes. The running parity of those counts says whether a
+// chunk starts inside a quoted field, so each thread can find the first real record start in
+// its chunk (a '\n' seen with an even number of quotes before it) and then parse records with a
+// proper CSV state machine until it reaches the next thread's first record. Each record is
+// joined to its country through a flat region_id -> group table. Per-group sums are kept per
+// thread and added at the end. Distinct names are counted with one shared table of name
+// hashes and a per-group bitset over its slots.
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -8,17 +18,24 @@
 #include <string>
 #include <thread>
 #include <vector>
+
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
 namespace {
+
+// Group ids are country indexes: at most 241 of them (240 countries plus _UNMATCHED), so these
+// tables hold bytes rather than halfwords. The biggest is region_id -> group, about 1M entries.
 constexpr uint8_t kNoGroup = 0xFF;
+
 struct Mapped {
     const char* p = nullptr;
     size_t n = 0;
 };
+
 Mapped map_file(const std::string& path) {
     Mapped m;
     const int fd = open(path.c_str(), O_RDONLY);
@@ -32,6 +49,7 @@ Mapped map_file(const std::string& path) {
     m.p = static_cast<const char*>(p);
     return m;
 }
+
 int thread_count() {
     cpu_set_t set;
     if (sched_getaffinity(0, sizeof set, &set) == 0) {
@@ -40,6 +58,11 @@ int thread_count() {
     }
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
+
+
+// Same hash for a field that is followed by at least 8 readable bytes (every name in records.csv is
+// followed by the closing quote and the rest of its record), so the tail is one load and a mask
+// instead of a variable-length memcpy call. That call was 6% of Track C's instructions.
 inline uint64_t hash_bytes_padded(const char* p, size_t n) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
     while (n >= 8) {
@@ -56,6 +79,9 @@ inline uint64_t hash_bytes_padded(const char* p, size_t n) {
     h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
     return h ^ (h >> 29);
 }
+
+// memchr for one byte, 16 bytes at a time; the quoted fields of a record are short, where the call
+// into libc costs more than the scan.
 inline const char* find_quote(const char* p, const char* end) {
     const __m256i q = _mm256_set1_epi8('"');
     while (p + 32 <= end) {
@@ -66,18 +92,27 @@ inline const char* find_quote(const char* p, const char* end) {
     }
     return static_cast<const char*>(memchr(p, '"', static_cast<size_t>(end - p)));
 }
+
 struct Agg {
     uint64_t count = 0, id_sum = 0, name_bytes = 0, note_bytes = 0;
     int64_t sum = 0, min = INT64_MAX, max = INT64_MIN;
 };
+
 struct Local {
     std::vector<Agg> agg;
     const std::vector<uint8_t>* region_group = nullptr;  // region id -> group (2 MB table)
 };
+
+// Distinct names. The spec draws names from a pool of 100,000 values, so every distinct name
+// gets a dense id from one table shared by all threads (compare-and-swap on the key), and each
+// group keeps a bitset over the ids it has seen. Memory is a few MB instead of one hash per
+// record, and a group's bitset is small enough to stay in cache.
 struct NameSet {
     static constexpr size_t kCap = size_t(1) << 18;      // table slots
     static constexpr size_t kMaxNames = size_t(1) << 17;  // ids; the table is half empty at most
     static constexpr size_t kWords = kMaxNames / 64;
+    // One 16-byte slot holds both the key and the id, so a probe touches one cache line instead of
+    // two arrays 2 MB apart. `id` is 0 until the thread that inserted the key has published it.
     struct Slot {
         uint64_t h;
         uint32_t id;
@@ -87,7 +122,9 @@ struct NameSet {
     std::atomic<uint32_t> next{0};
     std::atomic<bool> overflow{false};
     uint64_t* bits = nullptr;  // groups x kMaxNames bits
+
     void init(size_t groups) { bits = static_cast<uint64_t*>(calloc(groups * kWords, sizeof(uint64_t))); }
+
     uint32_t id_of(uint64_t h) {
         h |= 1;  // 0 marks an empty slot
         for (size_t i = h & (kCap - 1);; i = (i + 1) & (kCap - 1)) {
@@ -126,6 +163,11 @@ struct NameSet {
         return c;
     }
 };
+
+// Reads the digits at p and moves p to the first non-digit. Ids, region ids and the whole part of
+// an amount are 1 to 7 digits, which one 8-byte load can find the end of and convert with the same
+// three-multiply trick Track A uses for its latencies. Eight or more digits, or no digit at all,
+// take the byte loop (the ids in the generated data stay below 4e7, so that is the rare path).
 inline uint64_t read_digits(const char*& p) {
     uint64_t w;
     memcpy(&w, p, 8);
@@ -144,6 +186,9 @@ inline uint64_t read_digits(const char*& p) {
     while (static_cast<unsigned>(*p - '0') < 10) v = v * 10 + static_cast<uint64_t>(*p++ - '0');
     return v;
 }
+
+// Slow fallback for the last record (a 16-byte load there would pass the end of the mapping) and
+// for anything outside the generator's guarantees. It is byte at a time, so it never reads ahead.
 __attribute__((noinline)) const char* read_region_amount_scalar(const char* p, uint64_t& region,
                                                                int64_t& cents) {
     uint64_t r = 0;
@@ -163,6 +208,13 @@ __attribute__((noinline)) const char* read_region_amount_scalar(const char* p, u
     cents = neg ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
     return p;
 }
+
+// Parses "region,amount" (region up to 7 digits, amount -?0..99999.99, always two decimals) at p and
+// returns the pointer just past the two-digit fraction. One 16-byte load marks every digit, which
+// gives the comma and the decimal point. The region and the amount's whole part are then left-aligned
+// in the two 8-byte halves of one vector: vpmaddubsw forms base-100 words, vpmaddwd forms base-10000
+// dwords, and an 8-digit field is high*10000+low. Both numbers are converted by that same pair of
+// instructions. p must have 18 readable bytes (the last record takes the scalar path).
 inline const char* read_region_amount(const char* p, const char* end, uint64_t& region, int64_t& cents) {
     if (end - p < 18) return read_region_amount_scalar(p, region, cents);
     const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
@@ -176,6 +228,7 @@ inline const char* read_region_amount(const char* p, const char* end, uint64_t& 
     const unsigned wn = static_cast<unsigned>(__builtin_ctz((~dm) >> astart));  // whole digits, then '.'
     const unsigned dot = astart + wn;
     if (wn < 1 || wn > 5 || dot > 14) return read_region_amount_scalar(p, region, cents);
+
     uint64_t wr = static_cast<uint64_t>(_mm_cvtsi128_si64(v));  // the region's eight bytes
     uint64_t wa;
     memcpy(&wa, p + astart, 8);
@@ -190,6 +243,7 @@ inline const char* read_region_amount(const char* p, const char* end, uint64_t& 
                            static_cast<uint32_t>(_mm_extract_epi32(w32, 1));
     region = static_cast<uint32_t>(_mm_extract_epi32(w32, 2)) * 10000u +
              static_cast<uint32_t>(_mm_extract_epi32(w32, 3));
+
     const uint64_t frac = static_cast<uint64_t>(p[dot + 1] - '0') * 10 + static_cast<uint64_t>(p[dot + 2] - '0');
     p += dot + 3;
     if (*p == '\r') ++p;
@@ -198,6 +252,9 @@ inline const char* read_region_amount(const char* p, const char* end, uint64_t& 
     cents = neg ? -static_cast<int64_t>(v64) : static_cast<int64_t>(v64);
     return p;
 }
+// Scans one text field starting at p. Sets the unescaped length (and the hash of the unescaped
+// value when hash is not null) and moves p past the field, to the ',' after it. A quoted field
+// ends at the first '"' that is not part of a "" pair.
 inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, uint64_t* hash) {
     if (*p != '"') {
         const char* s = p;
@@ -218,10 +275,17 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     p = q + 1;
     const size_t raw = static_cast<size_t>(q - s);
     len = raw - escapes;
+    // The hash is taken over the text as written, doubled quotes included, and not over the unescaped
+    // value: escaping is a one-to-one encoding (every quote inside a field is doubled), so two names
+    // are equal exactly when their texts are, and the byte-by-byte unescaping of the one name in five
+    // that has a quote is not needed.
     if (hash) *hash = hash_bytes_padded(s, raw);
 }
+
 const char* parse_range(const char* p, const char* stop, const char* end, uint8_t unmatched, Local& L,
                         NameSet& names) {
+    // The names of 16 records are added together: the table slots and the bitset words are cache
+    // misses, and issuing all the prefetches first lets them overlap instead of stalling one by one.
     constexpr int kBatch = 64;
     struct Pending {
         uint64_t id, region, name_hash;
@@ -232,6 +296,9 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
     uint32_t batch_id[kBatch];
     uint16_t batch_group[kBatch];
     int batched = 0;
+    // A batch of 64 parsed records is finished together: the groups of all of them are looked up first
+    // (a random probe into a 2 MB table, so every probe is prefetched before the first is used), then the
+    // per-group sums are updated in one tight loop, then the names are added.
     auto flush = [&] {
         const std::vector<uint8_t>& rg = *L.region_group;
         for (int k = 0; k < batched; ++k)
@@ -270,6 +337,8 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
         ++p;
         scan_text(p, end, L, note_len, nullptr);  // only the note's length matters
         ++p;
+        // "region,amount" is one short run of digits at the end of the record: one 16-byte load finds
+        // the comma and the decimal point, and both numbers come out of the same masks.
         uint64_t region;
         int64_t cents;
         p = read_region_amount(p, end, region, cents);
@@ -279,6 +348,7 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
     flush();
     return p;
 }
+
 void put_cents(std::string& out, int64_t c) {
     if (c < 0) { out += '-'; c = -c; }
     out += std::to_string(c / 100);
@@ -286,15 +356,21 @@ void put_cents(std::string& out, int64_t c) {
     out += static_cast<char>('0' + (c % 100) / 10);
     out += static_cast<char>('0' + c % 10);
 }
+
 }  // namespace
+
 int main(int argc, char** argv) {
     std::string data = "/data", outdir = "/out";
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--data")) data = argv[i + 1];
         else if (!strcmp(argv[i], "--out")) outdir = argv[i + 1];
     }
+
+    // regions.csv: "region_id,country" header, then one "id,CCC" line per region.
     const Mapped reg = map_file(data + "/regions.csv");
     if (!reg.p) return 1;
+    // A code is three letters A-Z, so it indexes a 26^3 table directly, and that index order is
+    // the bytewise order of the codes.
     std::vector<std::pair<uint32_t, uint16_t>> regions;  // (region_id, code index)
     std::vector<uint8_t> code_group(26 * 26 * 26, kNoGroup);
     uint32_t max_id = 0;
@@ -318,8 +394,11 @@ int main(int argc, char** argv) {
     const uint8_t unmatched = static_cast<uint8_t>(codes.size());
     std::vector<uint8_t> region_group(static_cast<size_t>(max_id) + 1, kNoGroup);
     for (auto& r : regions) region_group[r.first] = code_group[r.second];
+    // The (id, code) list was only a convenient way to build the table above: 200,000 pairs, 1.6 MB.
+    // It goes back before the records are mapped and the aggregates are allocated.
     std::vector<std::pair<uint32_t, uint16_t>>().swap(regions);
     const size_t groups = codes.size() + 1;
+
     const Mapped rec = map_file(data + "/records.csv");
     std::vector<Local> locals;
     NameSet names;
@@ -331,9 +410,13 @@ int main(int argc, char** argv) {
         nt = rec.n < (1u << 20) ? 1 : thread_count();
         locals.resize(nt);
         for (auto& L : locals) { L.agg.assign(groups, Agg()); L.region_group = &region_group; }
+
         std::vector<const char*> chunk(nt + 1);
         for (int i = 0; i <= nt; ++i) chunk[i] = base + rec.n * static_cast<size_t>(i) / static_cast<size_t>(nt);
         const char* const hdr = static_cast<const char*>(memchr(base, '\n', rec.n)) + 1;  // skip BOM + header
+
+        // Parses every thread's records from the given first-record starts. Returns true when
+        // each thread stopped exactly where the next one started, i.e. the starts were right.
         auto parse_all = [&](const std::vector<const char*>& starts) {
             std::vector<const char*> ends(nt);
             std::vector<std::thread> th;
@@ -348,6 +431,10 @@ int main(int argc, char** argv) {
                 if (ends[i] != starts[i + 1]) return false;
             return true;
         };
+
+        // Fast start finder. A newline inside a quoted note is always followed by a lowercase
+        // letter or a quote, and a record really starts after a newline followed by a digit (an
+        // id) or a byte order mark (spec 2.2: ids are [1-9][0-9]*, notes are lowercase words).
         std::vector<const char*> starts(nt + 1, end);
         starts[0] = hdr;
         for (int i = 1; i < nt; ++i)
@@ -357,7 +444,10 @@ int main(int argc, char** argv) {
                     break;
                 }
         bool ok = parse_all(starts);
+
         if (!ok) {
+            // Fallback, exact for any input: count the '"' bytes of every chunk, so the parity
+            // says whether a chunk starts inside quotes, and start at a '\n' with an even count.
             for (auto& L : locals) L.agg.assign(groups, Agg());
             names.reset(groups);
             std::vector<uint8_t> parity(nt, 0);
@@ -385,7 +475,10 @@ int main(int argc, char** argv) {
             parse_all(starts);
         }
     }
+
     if (names.overflow.load()) return 1;  // more distinct names than the spec allows
+
+    // Add up the per-thread sums.
     std::vector<Agg> total(groups);
     for (auto& L : locals)
         for (size_t g = 0; g < groups; ++g) {
@@ -399,6 +492,7 @@ int main(int argc, char** argv) {
             t.name_bytes += a.name_bytes;
             t.note_bytes += a.note_bytes;
         }
+
     std::string out;
     for (size_t g = 0; g < groups; ++g) {
         const Agg& a = total[g];
