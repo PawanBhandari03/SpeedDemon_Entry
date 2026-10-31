@@ -391,8 +391,6 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> hour_done(kHours, 0);
     std::mutex write_mutex;
     int next_write = 0;
-    off_t done_from = 0;
-    constexpr off_t kHourBytes = 140 * 1024;  // a full hour of output is about this
     std::atomic<int> written{0};
     std::atomic<int> next_hour{0};
     parallel(nt, [&](int) {
@@ -476,14 +474,6 @@ int main(int argc, char** argv) {
                 std::string& done = hour_out[static_cast<size_t>(next_write)];
                 fwrite(done.data(), 1, done.size(), f);
                 std::string().swap(done);
-                // The pages of the output file are charged to the run until they are written back and
-                // dropped, and summary.txt is 10 MB. Start the writeback of what has just been written
-                // and drop the previous hour's pages, which are clean by now: the charge stays at
-                // roughly one hour of output instead of the whole file.
-                const off_t end = static_cast<off_t>(ftello(f));
-                sync_file_range(fileno(f), done_from, end - done_from, SYNC_FILE_RANGE_WRITE);
-                if (done_from > kHourBytes) posix_fadvise(fileno(f), 0, done_from - kHourBytes, POSIX_FADV_DONTNEED);
-                done_from = end;
             }
             written.store(next_write, std::memory_order_release);
         }
