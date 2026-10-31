@@ -42,15 +42,25 @@ int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
 inline int dig2(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 
 // Open-addressing table: endpoint bytes -> small id. The bytes stay in the mmap.
+//
+// Two levels, because the endpoint of a line is a Zipf draw: a 256-entry cache in front holds the
+// endpoints that actually repeat (4 KB, always in L1), and only a miss walks the 4096-slot table.
+// A slot is 16 bytes, so the table is 64 KB and a miss is an L2 access rather than an L3 one.
 struct EpTable {
     struct Slot {
-        const char* p = nullptr;
-        uint32_t len = 0;
-        uint32_t id = 0;
         uint64_t h = 0;
+        uint32_t id = 0;
+        uint32_t len = 0;
     };
-    static constexpr size_t kCap = 8192;
+    struct Line {
+        uint64_t h = 0;  // 0 marks an empty entry; intern() keeps hashes odd
+        uint32_t id = 0;
+        uint32_t len = 0;
+    };
+    static constexpr size_t kCap = 4096;    // the catalogue is 1,842 endpoints, so 45% full
+    static constexpr size_t kCache = 256;   // 4 KB of L1
     std::vector<Slot> slots = std::vector<Slot>(kCap);
+    std::vector<Line> cache = std::vector<Line>(kCache);
     std::vector<std::string_view> names;
 
     static uint64_t hash(const char* p, size_t n) {
@@ -66,23 +76,30 @@ struct EpTable {
         uint64_t w = 0;
         memcpy(&w, p, n);
         h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
-        return h ^ (h >> 29);
+        return (h ^ (h >> 29)) | 1;
     }
 
     uint16_t intern(const char* p, size_t n) {
         const uint64_t h = hash(p, n);
+        Line& c = cache[h & (kCache - 1)];
+        if (c.h == h && c.len == n) return static_cast<uint16_t>(c.id);
         size_t i = h & (kCap - 1);
         for (;; i = (i + 1) & (kCap - 1)) {
             Slot& s = slots[i];
-            if (!s.p) {
-                s = {p, static_cast<uint32_t>(n), static_cast<uint32_t>(names.size()), h};
+            if (!s.h) {
+                const uint32_t id = static_cast<uint32_t>(names.size());
+                s = {h, id, static_cast<uint32_t>(n)};
                 names.emplace_back(p, n);
-                return static_cast<uint16_t>(s.id);
+                c = {h, id, static_cast<uint32_t>(n)};
+                return static_cast<uint16_t>(id);
             }
             // The full 64-bit hash (seeded with the length) decides: comparing the bytes costs a cold load
             // from the first occurrence of the endpoint in the file, and two of the ~2000 endpoints
             // colliding has a chance of about 1e-13.
-            if (s.h == h && s.len == n) return static_cast<uint16_t>(s.id);
+            if (s.h == h && s.len == n) {
+                c = {h, s.id, s.len};
+                return static_cast<uint16_t>(s.id);
+            }
         }
     }
 };
