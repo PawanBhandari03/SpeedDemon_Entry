@@ -52,6 +52,31 @@ int thread_count() {
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
 
+// A zeroed array whose pages are committed only when they are written (calloc maps big blocks lazily).
+template <class T>
+struct LazyArray {
+    T* p;
+    explicit LazyArray(size_t n) : p(static_cast<T*>(calloc(n ? n : 1, sizeof(T)))) {}
+    ~LazyArray() { free(p); }
+    LazyArray(const LazyArray&) = delete;
+    LazyArray& operator=(const LazyArray&) = delete;
+    T& operator[](size_t i) { return p[i]; }
+    T* data() { return p; }
+    const T* data() const { return p; }
+};
+
+// Gives the whole pages of an array's consumed front back to the kernel, in steps of 1 MB.
+// `upto` is the address up to which pages were already given back.
+inline void release_pages(const void* base, size_t consumed_bytes, uintptr_t& upto) {
+    const uintptr_t first = (reinterpret_cast<uintptr_t>(base) + 4095) & ~uintptr_t(4095);
+    const uintptr_t hi = (reinterpret_cast<uintptr_t>(base) + consumed_bytes) & ~uintptr_t(4095);
+    if (upto < first) upto = first;
+    if (hi >= upto + (1u << 20)) {
+        madvise(reinterpret_cast<void*>(upto), hi - upto, MADV_DONTNEED);
+        upto = hi;
+    }
+}
+
 // Runs f(i) on threads 0..n-1 and waits for all of them.
 template <class F>
 void parallel(int n, F&& f) {
@@ -413,15 +438,25 @@ int main(int argc, char** argv) {
         }
         if (pass == 0) positional_total = run;
     }
-    std::vector<uint32_t> postings(run), post_off(positional_total), df(Q);
+    LazyArray<uint32_t> postings(run), post_off(positional_total);
+    std::vector<uint32_t> df(Q);
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
-        for (size_t k = 0, r = 0; k < w.doc_end.size(); ++k)
+        // The consumed front of each stream goes back to the kernel while the postings fill up, so
+        // the streams and the postings are never both fully resident.
+        uintptr_t up_terms = 0, up_occ = 0, up_offs = 0;
+        for (size_t k = 0, r = 0; k < w.doc_end.size(); ++k) {
             for (; r < w.doc_end[k]; ++r) postings[w.count[w.terms[r]]++] = w.first_doc + static_cast<uint32_t>(k);
+            if ((k & 4095) == 0) release_pages(w.terms.data(), r * sizeof(uint32_t), up_terms);
+        }
         for (size_t j = 0; j < w.occ.size(); ++j) {
             const uint32_t at = w.count[w.occ[j] >> 32]++;
             postings[at] = static_cast<uint32_t>(w.occ[j]);
             post_off[at] = w.offs[j];
+            if ((j & 32767) == 0) {
+                release_pages(w.occ.data(), j * sizeof(uint64_t), up_occ);
+                release_pages(w.offs.data(), j * sizeof(uint32_t), up_offs);
+            }
         }
         std::vector<uint32_t>().swap(w.terms);
         std::vector<uint32_t>().swap(w.doc_end);
