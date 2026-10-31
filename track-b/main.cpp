@@ -178,7 +178,7 @@ struct Dict {
 constexpr unsigned kGroups = 4;
 
 struct Worker {
-    std::vector<uint32_t> terms[kGroups];    // rare terms, once per document, in document order
+    std::vector<uint16_t> terms[kGroups];    // rare terms (term / kGroups), once per document, in document order
     std::vector<uint32_t> doc_end[kGroups];  // per document of this worker: end of its run in terms
     uint32_t first_doc = 0;
     std::vector<uint64_t> occ[kGroups];      // (term << 32) | doc for every occurrence of a phrase-driver term
@@ -264,6 +264,7 @@ int main(int argc, char** argv) {
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
     const uint32_t Q = static_cast<uint32_t>(keys.size());
+    if (Q > kGroups * 65536u) return 1;  // the term streams hold term / kGroups in 16 bits (the spec has about 76,000 terms)
     Dict dict;
     dict.init(Q);
     for (uint32_t i = 0; i < Q; ++i) dict.insert(keys[i], i);
@@ -413,7 +414,7 @@ int main(int argc, char** argv) {
                 if (st[t].last == doc) return;
                 st[t].last = doc;
                 ++st[t].count;
-                w.terms[t % kGroups].push_back(t);
+                w.terms[t % kGroups].push_back(static_cast<uint16_t>(t / kGroups));
             });
             for (unsigned g = 0; g < kGroups; ++g) w.doc_end[g].push_back(static_cast<uint32_t>(w.terms[g].size()));
         }
@@ -447,13 +448,13 @@ int main(int argc, char** argv) {
         parallel(nt, [&](int i) {
             Worker& w = workers[i];
             for (size_t k = 0, r = 0; k < w.doc_end[g].size(); ++k)
-                for (; r < w.doc_end[g][k]; ++r) postings[g][w.count[w.terms[g][r]]++] = w.first_doc + static_cast<uint32_t>(k);
+                for (; r < w.doc_end[g][k]; ++r) postings[g][w.count[static_cast<uint32_t>(w.terms[g][r]) * kGroups + g]++] = w.first_doc + static_cast<uint32_t>(k);
             for (size_t j = 0; j < w.occ[g].size(); ++j) {
                 const uint32_t at = w.count[w.occ[g][j] >> 32]++;
                 postings[g][at] = static_cast<uint32_t>(w.occ[g][j]);
                 post_off[g][at] = w.offs[g][j];
             }
-            std::vector<uint32_t>().swap(w.terms[g]);
+            std::vector<uint16_t>().swap(w.terms[g]);
             std::vector<uint32_t>().swap(w.doc_end[g]);
             std::vector<uint64_t>().swap(w.occ[g]);
             std::vector<uint32_t>().swap(w.offs[g]);
