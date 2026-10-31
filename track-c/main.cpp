@@ -59,21 +59,6 @@ int thread_count() {
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
 
-uint64_t hash_bytes(const char* p, size_t n) {
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
-    while (n >= 8) {
-        uint64_t w;
-        memcpy(&w, p, 8);
-        h = (h ^ w) * 0xff51afd7ed558ccdull;
-        h ^= h >> 32;
-        p += 8;
-        n -= 8;
-    }
-    uint64_t w = 0;
-    memcpy(&w, p, n);
-    h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
-    return h ^ (h >> 29);
-}
 
 // Same hash for a field that is followed by at least 8 readable bytes (every name in records.csv is
 // followed by the closing quote and the rest of its record), so the tail is one load and a mask
@@ -115,7 +100,7 @@ struct Agg {
 
 struct Local {
     std::vector<Agg> agg;
-    std::string scratch;
+    char esc[64];  // an unescaped name, padded so the hash can read eight bytes past it
     // region id -> group, with the hot ids kept by a small direct-mapped cache: region popularity
     // is skewed, so a cache this size answers a good share of the lookups without touching the
     // 2 MB table. Id 0 is a free line, and region ids start at 1.
@@ -260,7 +245,7 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
         const char* s = p;
         while (*p != ',') ++p;
         len = static_cast<size_t>(p - s);
-        if (hash) *hash = hash_bytes(s, len);
+        if (hash) *hash = hash_bytes_padded(s, len);
         return;
     }
     const char* s = ++p;
@@ -280,12 +265,13 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
         *hash = hash_bytes_padded(s, raw);
         return;
     }
-    L.scratch.clear();
+    size_t n = 0;
     for (const char* x = s; x < q; ++x) {
-        L.scratch.push_back(*x);
+        L.esc[n++] = *x;
         if (*x == '"') ++x;  // second quote of the pair
     }
-    *hash = hash_bytes(L.scratch.data(), L.scratch.size());
+    memset(L.esc + n, 0, 8);  // padding for the hash's eight-byte tail load
+    *hash = hash_bytes_padded(L.esc, n);
 }
 
 const char* parse_range(const char* p, const char* stop, const char* end, uint8_t unmatched, Local& L,
