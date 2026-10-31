@@ -357,6 +357,50 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
     return p;
 }
 
+// Parses the records of [begin, stop) of the file (both at record starts) in blocks of 128 KB read into a
+// buffer that stays in the L2 cache, instead of from the mapping: the mapping costs a page fault and a TLB
+// entry per 4 KB for data that is read once. A block ends at its last record start, a LF followed by a
+// digit or a byte order mark (the same rule that cuts the file between the threads), and the rest of the
+// block moves to the front of the buffer. Returns stop when every block parsed up to its end, and null
+// when one did not (a record that did not fit the rule); the caller then parses with the exact method.
+const char* parse_blocks(int fd, const char* base, const char* begin, const char* stop, uint8_t unmatched, Local& L,
+                         NameSet& names) {
+    constexpr size_t kBuf = size_t(1) << 17;
+    char* buf = static_cast<char*>(aligned_alloc(64, kBuf + 128));
+    size_t have = 0, pos = static_cast<size_t>(begin - base);
+    const size_t stop_pos = static_cast<size_t>(stop - base);
+    bool good = true;
+    for (;;) {
+        const size_t want = std::min(kBuf - have, stop_pos - pos);
+        size_t got = 0;
+        while (got < want) {
+            const ssize_t r = pread(fd, buf + have + got, want - got, static_cast<off_t>(pos + got));
+            if (r <= 0) break;
+            got += static_cast<size_t>(r);
+        }
+        pos += got;
+        have += got;
+        const bool last = pos >= stop_pos || got < want;
+        size_t used = have;
+        if (!last) {
+            used = 0;
+            for (size_t x = have - 1; x-- > 0;)
+                if (buf[x] == '\n' && (static_cast<unsigned>(static_cast<uint8_t>(buf[x + 1]) - '0') < 10 || static_cast<uint8_t>(buf[x + 1]) == 0xEF)) {
+                    used = x + 1;
+                    break;
+                }
+            if (!used) { good = false; break; }
+        }
+        memset(buf + have, 0, 64);
+        if (parse_range(buf, buf + used, buf + have, unmatched, L, names) != buf + used) { good = false; break; }
+        if (last) break;
+        memmove(buf, buf + used, have - used);
+        have -= used;
+    }
+    free(buf);
+    return good ? stop : nullptr;
+}
+
 void put_cents(std::string& out, int64_t c) {
     if (c < 0) { out += '-'; c = -c; }
     out += std::to_string(c / 100);
@@ -408,6 +452,7 @@ int main(int argc, char** argv) {
     const size_t groups = codes.size() + 1;
 
     const Mapped rec = map_file(data + "/records.csv");
+    const int rfd = open((data + "/records.csv").c_str(), O_RDONLY);
     std::vector<Local> locals;
     NameSet names;
     names.init(groups);
@@ -425,14 +470,14 @@ int main(int argc, char** argv) {
 
         // Parses every thread's records from the given first-record starts. Returns true when
         // each thread stopped exactly where the next one started, i.e. the starts were right.
-        auto parse_all = [&](const std::vector<const char*>& starts) {
+        auto parse_all = [&](const std::vector<const char*>& starts, bool blocks) {
             std::vector<const char*> ends(nt);
             std::vector<std::thread> th;
             for (int i = 0; i < nt; ++i)
                 th.emplace_back([&, i] {
-                    ends[i] = starts[i] < starts[i + 1]
-                                  ? parse_range(starts[i], starts[i + 1], end, unmatched, locals[i], names)
-                                  : starts[i];
+                    ends[i] = starts[i] >= starts[i + 1] ? starts[i]
+                              : blocks ? parse_blocks(rfd, base, starts[i], starts[i + 1], unmatched, locals[i], names)
+                                       : parse_range(starts[i], starts[i + 1], end, unmatched, locals[i], names);
                 });
             for (auto& t : th) t.join();
             for (int i = 0; i < nt; ++i)
@@ -451,7 +496,7 @@ int main(int argc, char** argv) {
                     starts[i] = x + 1;
                     break;
                 }
-        bool ok = parse_all(starts);
+        bool ok = rfd >= 0 && parse_all(starts, true);
 
         if (!ok) {
             // Fallback, exact for any input: count the '"' bytes of every chunk, so the parity
@@ -480,7 +525,7 @@ int main(int argc, char** argv) {
                 }
                 inside ^= parity[i];
             }
-            parse_all(starts);
+            parse_all(starts, false);
         }
     }
 
