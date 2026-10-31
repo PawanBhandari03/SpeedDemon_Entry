@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,6 +71,39 @@ uint64_t hash_bytes(const char* p, size_t n) {
     memcpy(&w, p, n);
     h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
     return h ^ (h >> 29);
+}
+
+// Same hash for a field that is followed by at least 8 readable bytes (every name in records.csv is
+// followed by the closing quote and the rest of its record), so the tail is one load and a mask
+// instead of a variable-length memcpy call. That call was 6% of Track C's instructions.
+inline uint64_t hash_bytes_padded(const char* p, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+        p += 8;
+        n -= 8;
+    }
+    uint64_t w;
+    memcpy(&w, p, 8);
+    w &= (n == 0) ? 0 : (~uint64_t(0) >> ((8 - n) * 8));
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
+    return h ^ (h >> 29);
+}
+
+// memchr for one byte, 16 bytes at a time; the quoted fields of a record are short, where the call
+// into libc costs more than the scan.
+inline const char* find_quote(const char* p, const char* end) {
+    const __m128i q = _mm_set1_epi8('"');
+    while (p + 16 <= end) {
+        const unsigned m = static_cast<unsigned>(
+            _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), q)));
+        if (m) return p + __builtin_ctz(m);
+        p += 16;
+    }
+    return static_cast<const char*>(memchr(p, '"', static_cast<size_t>(end - p)));
 }
 
 struct Agg {
@@ -160,8 +194,24 @@ struct NameSet {
     }
 };
 
-// Reads the digits at p and moves p to the first non-digit.
+// Reads the digits at p and moves p to the first non-digit. Ids, region ids and the whole part of
+// an amount are 1 to 7 digits, which one 8-byte load can find the end of and convert with the same
+// three-multiply trick Track A uses for its latencies. Eight or more digits, or no digit at all,
+// take the byte loop (the ids in the generated data stay below 4e7, so that is the rare path).
 inline uint64_t read_digits(const char*& p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    const uint64_t x = w ^ 0x3030303030303030ull;              // digit byte -> 0x00..0x09
+    const uint64_t bad = ((x + 0x7676767676767676ull) | x) & 0x8080808080808080ull;
+    if (bad && !(bad & 0xFFull)) {                             // 1 to 7 digits, then a non-digit
+        const unsigned n = static_cast<unsigned>(__builtin_ctzll(bad)) / 8;
+        uint64_t v = (w << ((8 - n) * 8)) & 0x0F0F0F0F0F0F0F0Full;
+        v = ((v * 2561) >> 8);
+        v = ((v & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
+        v = ((v & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
+        p += n;
+        return v;
+    }
     uint64_t v = 0;
     while (static_cast<unsigned>(*p - '0') < 10) v = v * 10 + static_cast<uint64_t>(*p++ - '0');
     return v;
@@ -182,7 +232,7 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     size_t escapes = 0;
     const char* q = s;
     for (;;) {
-        q = static_cast<const char*>(memchr(q, '"', static_cast<size_t>(end - q)));
+        q = find_quote(q, end);
         if (q[1] != '"') break;
         ++escapes;
         q += 2;
@@ -192,7 +242,7 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     len = raw - escapes;
     if (!hash) return;
     if (!escapes) {
-        *hash = hash_bytes(s, raw);
+        *hash = hash_bytes_padded(s, raw);
         return;
     }
     L.scratch.clear();
