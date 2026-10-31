@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include <immintrin.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -105,11 +106,44 @@ inline uint64_t token_key(const char* s, size_t n, const char* limit) {
 
 // Calls f(key, start) for every token of one document line starting at p (the id, a TAB, then
 // the text); start points at the token's first byte. Returns a pointer just past the line's LF.
-// Every line ends with an LF, so the loops need no end check.
+// 32 bytes at a time: one mask of the token bytes and one of the LFs per window, and the token
+// boundaries are the bits where the mask changes. A token that runs into the next window is
+// carried over in `start`. The last bytes of the buffer are finished byte by byte, so no window
+// reads past the end.
 template <class F>
 inline const char* tokenize_line(const char* p, const char* end, F&& f) {
     while (*p != '\t') ++p;
     ++p;
+    const char* start = nullptr;  // first byte of the token that is open at the start of the window
+    uint32_t prev = 0;            // 1 when the byte before the window is a token byte
+    for (; p + 32 <= end; p += 32) {
+        const __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        const __m256i lower = _mm256_or_si256(c, _mm256_set1_epi8(0x20));  // A-Z -> a-z
+        const __m256i alpha = _mm256_and_si256(_mm256_cmpgt_epi8(lower, _mm256_set1_epi8('a' - 1)),
+                                               _mm256_cmpgt_epi8(_mm256_set1_epi8('z' + 1), lower));
+        const __m256i digit = _mm256_and_si256(_mm256_cmpgt_epi8(c, _mm256_set1_epi8('0' - 1)),
+                                               _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), c));
+        const uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(alpha, digit)));
+        const uint32_t nl = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, _mm256_set1_epi8('\n'))));
+        const uint32_t upto = nl ? (2u << __builtin_ctz(nl)) - 1 : ~0u;  // the bits up to the first LF
+        uint32_t ev = (m ^ ((m << 1) | prev)) & upto;  // bit i: byte i differs from byte i-1 in being a token byte
+        while (ev) {
+            const char* at = p + __builtin_ctz(ev);
+            ev &= ev - 1;
+            if (!start) {
+                start = at;  // a token starts here ...
+            } else {         // ... or the open token ends here
+                f(token_key(start, static_cast<size_t>(at - start), end), start);
+                start = nullptr;
+            }
+        }
+        if (nl) return p + __builtin_ctz(nl) + 1;
+        prev = m >> 31;
+    }
+    if (start) {
+        while (g_kind[static_cast<uint8_t>(*p)] == 1) ++p;
+        f(token_key(start, static_cast<size_t>(p - start), end), start);
+    }
     for (;;) {
         uint8_t k;
         while ((k = g_kind[static_cast<uint8_t>(*p)]) == 0) ++p;  // separators
