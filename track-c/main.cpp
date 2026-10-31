@@ -176,10 +176,10 @@ struct NameSet {
         }
     }
     void prefetch_slot(uint64_t h) const { __builtin_prefetch(&slots[(h | 1) & (kCap - 1)].h); }
-    void prefetch_bit(size_t group, uint32_t id) const { __builtin_prefetch(&bits[group * kWords + (id < kMaxNames ? id : 0) / 64]); }
+    void prefetch_bit(size_t group, uint32_t id) const { __builtin_prefetch(&bits[group * kWords + (id >> 6)]); }
     void set(size_t group, uint32_t id) {
         if (id >= kMaxNames) { overflow.store(true, std::memory_order_relaxed); id = 0; }
-        uint64_t& w = bits[group * kWords + id / 64];
+        uint64_t& w = bits[group * kWords + (id >> 6)];
         const uint64_t bit = 1ull << (id % 64);
         if (!(std::atomic_ref<uint64_t>(w).load(std::memory_order_relaxed) & bit))
             std::atomic_ref<uint64_t>(w).fetch_or(bit, std::memory_order_relaxed);
