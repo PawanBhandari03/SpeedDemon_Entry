@@ -57,6 +57,7 @@ struct EpTable {
     std::vector<Slot> slots = std::vector<Slot>(kCap);
     std::vector<Line> cache = std::vector<Line>(kCache);
     std::vector<std::string_view> names;
+    std::vector<uint64_t> hashes;  // the hash of every name, to merge the workers' tables
     std::deque<std::string> store;  // the bytes of the names: the read buffer is reused
 
     static uint64_t hash(const char* p, size_t n) {
@@ -89,6 +90,7 @@ struct EpTable {
                 s = {h, id, static_cast<uint32_t>(n)};
                 store.emplace_back(p, n);
                 names.emplace_back(store.back());
+                hashes.push_back(h);
                 c = {h, id, static_cast<uint32_t>(n)};
                 return static_cast<uint16_t>(id);
             }
@@ -344,6 +346,37 @@ void scan_range(int fd, size_t begin, size_t end, Worker& w) {
     free(buf);
 }
 
+// The values of ranks r50 <= r95 <= r99 (1-based) among the n <= 64 values in v, without sorting. The
+// rank of a value is the number of smaller values plus the number of equal values before it, counted
+// eight at a time with vector compares, so no branch depends on the data and every value gets a
+// distinct rank. Unsigned compares are signed compares after flipping the top bit; the padding of the
+// last group is the largest value, which is never smaller than a real one and comes after it.
+inline void select3(const uint32_t* v, size_t n, size_t r50, size_t r95, size_t r99, uint32_t& q50, uint32_t& q95,
+                    uint32_t& q99) {
+    alignas(32) uint32_t x[72];
+    const size_t groups = (n + 7) / 8;
+    for (size_t j = 0; j < groups * 8; ++j) x[j] = (j < n ? v[j] : UINT32_MAX) ^ 0x80000000u;
+    const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    for (size_t i = 0; i < n; ++i) {
+        const __m256i vi = _mm256_set1_epi32(static_cast<int>(x[i]));
+        const __m256i ii = _mm256_set1_epi32(static_cast<int>(i));
+        __m256i acc = _mm256_setzero_si256();
+        for (size_t g = 0; g < groups; ++g) {
+            const __m256i vj = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + g * 8));
+            const __m256i before = _mm256_cmpgt_epi32(ii, _mm256_add_epi32(lane, _mm256_set1_epi32(static_cast<int>(g * 8))));
+            const __m256i smaller = _mm256_or_si256(_mm256_cmpgt_epi32(vi, vj), _mm256_and_si256(_mm256_cmpeq_epi32(vi, vj), before));
+            acc = _mm256_sub_epi32(acc, smaller);  // the masks are -1
+        }
+        __m128i t = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+        t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0x4E));
+        t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0xB1));
+        const size_t rank = static_cast<size_t>(_mm_cvtsi128_si32(t)) + 1;  // 1-based
+        if (rank == r50) q50 = v[i];
+        if (rank == r95) q95 = v[i];
+        if (rank == r99) q99 = v[i];
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -385,17 +418,54 @@ int main(int argc, char** argv) {
     for (auto& w : workers) if (w.bad) return 1;
 
     // Global endpoint ids, assigned in byte order, and for every worker the map from the global id
-    // back to its local one (UINT32_MAX when the worker never saw the endpoint).
-    std::vector<std::string_view> eps;
-    for (auto& w : workers) eps.insert(eps.end(), w.table.names.begin(), w.table.names.end());
-    std::sort(eps.begin(), eps.end());
-    eps.erase(std::unique(eps.begin(), eps.end()), eps.end());
-    const size_t E = eps.size();
+    // back to its local one (UINT32_MAX when the worker never saw the endpoint). The names of all
+    // workers (about 22,000 for 1,842 endpoints) are merged through one hash table first, so only the
+    // distinct names are sorted.
+    std::vector<std::string_view> uniq;
+    std::vector<uint64_t> uniq_hash;
+    std::vector<std::vector<uint32_t>> merged(nt);  // [worker][local id] -> index in uniq
+    {
+        size_t total = 0;
+        for (auto& w : workers) total += w.table.names.size();
+        size_t cap = 16;
+        while (cap < total * 2) cap <<= 1;
+        std::vector<int32_t> table(cap, -1);
+        for (int i = 0; i < nt; ++i) {
+            const EpTable& t = workers[i].table;
+            merged[i].resize(t.names.size());
+            for (size_t lep = 0; lep < t.names.size(); ++lep) {
+                const uint64_t h = t.hashes[lep];
+                size_t k = h & (cap - 1);
+                for (;; k = (k + 1) & (cap - 1)) {
+                    const int32_t u = table[k];
+                    if (u < 0) {
+                        table[k] = static_cast<int32_t>(uniq.size());
+                        merged[i][lep] = static_cast<uint32_t>(uniq.size());
+                        uniq.push_back(t.names[lep]);
+                        uniq_hash.push_back(h);
+                        break;
+                    }
+                    if (uniq_hash[static_cast<size_t>(u)] == h && uniq[static_cast<size_t>(u)] == t.names[lep]) {
+                        merged[i][lep] = static_cast<uint32_t>(u);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    const size_t E = uniq.size();
+    std::vector<uint32_t> order(E);
+    for (size_t k = 0; k < E; ++k) order[k] = static_cast<uint32_t>(k);
+    std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return uniq[x] < uniq[y]; });
+    std::vector<std::string_view> eps(E);
+    std::vector<uint32_t> rank_of(E);
+    for (size_t r = 0; r < E; ++r) {
+        eps[r] = uniq[order[r]];
+        rank_of[order[r]] = static_cast<uint32_t>(r);
+    }
     std::vector<std::vector<uint32_t>> local_of(nt, std::vector<uint32_t>(E, UINT32_MAX));
     for (int i = 0; i < nt; ++i)
-        for (size_t lep = 0; lep < workers[i].table.names.size(); ++lep)
-            local_of[i][static_cast<size_t>(std::lower_bound(eps.begin(), eps.end(), workers[i].table.names[lep]) - eps.begin())] =
-                static_cast<uint32_t>(lep);
+        for (size_t lep = 0; lep < merged[i].size(); ++lep) local_of[i][rank_of[merged[i][lep]]] = static_cast<uint32_t>(lep);
 
     // The four dates in the span, then the hour on the end: 13 characters each, "YYYY-MM-DDTHH".
     static const char kDay[4][12] = {"2026-10-30T", "2026-10-31T", "2026-11-01T", "2026-11-02T"};
@@ -475,14 +545,16 @@ int main(int argc, char** argv) {
                     }
                 }
                 const size_t r99 = (99 * n + 99) / 100, r95 = (95 * n + 99) / 100, r50 = (50 * n + 99) / 100;
+                uint32_t q50, q95, q99;
                 if (n <= 64) {
-                    // Most buckets are small: a plain sort of a few values beats three selections.
-                    std::sort(v, v + n);
+                    // Most buckets are small, and a sort of a few values is all branch mispredictions.
+                    select3(v, n, r50, r95, r99, q50, q95, q99);
                 } else {
                     // Each selection leaves the smaller ranks in front, so the next one searches less.
                     std::nth_element(v, v + r99 - 1, v + n);
                     std::nth_element(v, v + r95 - 1, v + r99);
                     std::nth_element(v, v + r50 - 1, v + r95);
+                    q50 = v[r50 - 1], q95 = v[r95 - 1], q99 = v[r99 - 1];
                 }
                 char* p = line;
                 memcpy(p, hourstr[h], 13); p += 13;  // YYYY-MM-DDTHH
@@ -490,9 +562,9 @@ int main(int argc, char** argv) {
                 const std::string_view name = eps[e];
                 memcpy(p, name.data(), name.size()); p += name.size();
                 *p++ = ' '; p = put_u64(p, n);
-                *p++ = ' '; p = put_u64(p, v[r50 - 1]);
-                *p++ = ' '; p = put_u64(p, v[r95 - 1]);
-                *p++ = ' '; p = put_u64(p, v[r99 - 1]);
+                *p++ = ' '; p = put_u64(p, q50);
+                *p++ = ' '; p = put_u64(p, q95);
+                *p++ = ' '; p = put_u64(p, q99);
                 *p++ = ' '; p = put_u64(p, errs);
                 *p++ = ' '; p = put_u64(p, errs * 1000000ull / n);
                 *p++ = '\n';
