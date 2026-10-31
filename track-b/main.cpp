@@ -614,8 +614,14 @@ int main(int argc, char** argv) {
         post_off[g].resize(positional_total[g]);
         parallel(nt, [&](int i) {
             Worker& w = workers[i];
+            // Every entry is a random write into the posting array, so the slot of the entry 12 places
+            // ahead is prefetched (the cursor it will use may still move by then, but not out of its line).
+            const size_t total = w.doc_end[g].empty() ? 0 : w.doc_end[g].back();
             for (size_t k = 0, r = 0; k < w.doc_end[g].size(); ++k)
-                for (; r < w.doc_end[g][k]; ++r) postings[g][w.count[static_cast<uint32_t>(w.terms[g][r]) * kGroups + g]++] = w.first_doc + static_cast<uint32_t>(k);
+                for (; r < w.doc_end[g][k]; ++r) {
+                    __builtin_prefetch(postings[g].data() + w.count[static_cast<uint32_t>(w.terms[g][std::min(r + 12, total - 1)]) * kGroups + g], 1);
+                    postings[g][w.count[static_cast<uint32_t>(w.terms[g][r]) * kGroups + g]++] = w.first_doc + static_cast<uint32_t>(k);
+                }
             for (size_t j = 0; j < w.occ[g].size(); ++j) {
                 const uint32_t at = w.count[w.occ[g][j] >> 32]++;
                 postings[g][at] = static_cast<uint32_t>(w.occ[g][j]);
