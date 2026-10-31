@@ -257,7 +257,7 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint16
                         NameSet& names) {
     // The names of 16 records are added together: the table slots and the bitset words are cache
     // misses, and issuing all the prefetches first lets them overlap instead of stalling one by one.
-    constexpr int kBatch = 16;
+    constexpr int kBatch = 64;
     uint64_t batch_hash[kBatch];
     uint32_t batch_id[kBatch];
     uint16_t batch_group[kBatch];
@@ -284,6 +284,9 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint16
         ++p;
         const uint64_t region = read_digits(p);
         ++p;
+        // The region's group is a random probe into a 2 MB table; issue it now so the amount below
+        // covers part of its latency.
+        if (region < L.region_group->size()) __builtin_prefetch(&(*L.region_group)[region]);
         const bool neg = *p == '-';
         p += neg;
         const uint64_t whole = read_digits(p);
