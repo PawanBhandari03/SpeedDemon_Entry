@@ -655,6 +655,12 @@ int main(int argc, char** argv) {
 
     // ---- Answer the queries in parallel.
     std::vector<std::string> results(queries.size());
+    // The queries run sorted by their first term, so that the ones that start from the same common word
+    // work on the same bitset one after the other and it stays in the cache; each answer goes to its own
+    // place in results, so the output order does not change.
+    std::vector<uint32_t> order(queries.size());
+    for (size_t k = 0; k < order.size(); ++k) order[k] = static_cast<uint32_t>(k);
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return qid[queries[x].first] < qid[queries[y].first]; });
     {
         std::atomic<size_t> next{0};
         std::vector<std::thread> th;
@@ -664,7 +670,8 @@ int main(int argc, char** argv) {
                 char buf[256];
                 constexpr size_t kBatch = 64;
                 for (size_t q0; (q0 = next.fetch_add(kBatch)) < queries.size();)
-                    for (size_t qi = q0; qi < std::min(queries.size(), q0 + kBatch); ++qi) {
+                    for (size_t oi = q0; oi < std::min(queries.size(), q0 + kBatch); ++oi) {
+                        const size_t qi = order[oi];
                         const Query& q = queries[qi];
                         const uint32_t* ids = qid.data() + q.first;
                         uint64_t count = 0, sum = 0;
