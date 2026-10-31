@@ -18,7 +18,6 @@
 #include <thread>
 #include <vector>
 
-#include <immintrin.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -182,156 +181,6 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     *hash = hash_bytes(L.scratch.data(), L.scratch.size());
 }
 
-// One record's parsed fields.
-struct Fields {
-    uint64_t id = 0, name_hash = 0, region = 0;
-    size_t name_len = 0, note_len = 0;
-    int64_t cents = 0;
-};
-
-inline uint64_t load8(const char* p) {
-    uint64_t w;
-    memcpy(&w, p, 8);
-    return w;
-}
-
-// Value of the len (1..8) digits at s, or UINT64_MAX when a byte is not a digit. Reads the 8
-// bytes that end with the digits, clears the ones in front, and turns the 8 digits (leading
-// zeros included) into a number with three multiplications instead of a loop with a data-
-// dependent exit.
-inline uint64_t parse_digits(const char* s, size_t len) {
-    const uint64_t keep = ~uint64_t(0) << ((8 - len) * 8);
-    uint64_t v = (load8(s + len - 8) & keep) | (0x3030303030303030ull & ~keep);
-    if (((v + 0x4646464646464646ull) | (v - 0x3030303030303030ull)) & 0x8080808080808080ull) return UINT64_MAX;
-    v = ((v & 0x0F0F0F0F0F0F0F0Full) * 2561) >> 8;
-    v = ((v & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
-    return ((v & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
-}
-
-// Number of '"' bytes among the n bytes at s. May read up to 7 bytes past the end.
-inline unsigned count_quotes(const char* s, size_t n) {
-    unsigned c = 0;
-    for (; n; s += 8, n -= std::min<size_t>(n, 8)) {
-        uint64_t x = load8(s) ^ 0x2222222222222222ull;
-        if (n < 8) x |= ~uint64_t(0) << (n * 8);  // bytes past the field count as "not a quote"
-        c += static_cast<unsigned>(__builtin_popcountll(~(((x & 0x7F7F7F7F7F7F7F7Full) + 0x7F7F7F7F7F7F7F7Full) | x | 0x7F7F7F7F7F7F7F7Full)));
-    }
-    return c;
-}
-
-// Offsets (from p) of every ',' and LF outside quotes in the n bytes at p, n a multiple of 64.
-// p must be outside quotes. A bit per byte says whether it is inside quotes: the running xor of the
-// quote bits, computed with a carry-less multiplication by all ones. A doubled quote inside a
-// field toggles twice, so it needs no special case. Returns the number of offsets.
-inline size_t index_structure(const char* p, size_t n, uint32_t* out) {
-    const __m256i quote = _mm256_set1_epi8('"'), comma = _mm256_set1_epi8(','), lf = _mm256_set1_epi8('\n');
-    const __m128i ones = _mm_set1_epi8(-1);
-    uint64_t inside_at_start = 0;  // all ones when the block starts inside quotes
-    size_t k = 0;
-    for (size_t b = 0; b < n; b += 64) {
-        const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + b));
-        const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + b + 32));
-        auto mask = [&](__m256i c) {
-            return static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, c)))) |
-                   static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, c)))) << 32;
-        };
-        const uint64_t q = mask(quote);
-        const uint64_t inside =
-            static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(static_cast<long long>(q)), ones, 0))) ^ inside_at_start;
-        inside_at_start = static_cast<uint64_t>(static_cast<int64_t>(inside) >> 63);
-        uint64_t sep = (mask(comma) | mask(lf)) & ~inside;
-        while (sep) {
-            out[k++] = static_cast<uint32_t>(b + static_cast<size_t>(__builtin_ctzll(sep)));
-            sep &= sep - 1;
-        }
-    }
-    return k;
-}
-
-// Reads one record byte by byte. Handles whatever the fast path does not: a byte order mark,
-// numbers of an unexpected shape, records that do not fit a window, the end of the file.
-const char* scalar_record(const char* p, const char* end, Local& L, Fields& f) {
-    if (static_cast<uint8_t>(p[0]) == 0xEF && static_cast<uint8_t>(p[1]) == 0xBB && static_cast<uint8_t>(p[2]) == 0xBF)
-        p += 3;  // byte order mark at the start of a record
-    f.id = read_digits(p);
-    ++p;
-    scan_text(p, end, L, f.name_len, &f.name_hash);
-    ++p;
-    scan_text(p, end, L, f.note_len, nullptr);  // only the note's length matters
-    ++p;
-    f.region = read_digits(p);
-    ++p;
-    const bool neg = *p == '-';
-    p += neg;
-    const uint64_t whole = read_digits(p);
-    const uint64_t frac = static_cast<uint64_t>(p[1] - '0') * 10 + static_cast<uint64_t>(p[2] - '0');
-    p += 3;
-    if (*p == '\r') ++p;
-    if (p < end && *p == '\n') ++p;
-    f.cents = neg ? -static_cast<int64_t>(whole * 100 + frac) : static_cast<int64_t>(whole * 100 + frac);
-    return p;
-}
-
-// Length of a text field's value, and the hash of it when hash is not null. [b, e) is the field
-// as written (quotes included). False when the field is not shaped as expected.
-inline bool text_field(const char* b, const char* e, Local& L, size_t& len, uint64_t* hash) {
-    if (e == b || *b != '"') {
-        len = static_cast<size_t>(e - b);
-        if (hash) *hash = hash_bytes(b, len);
-        return true;
-    }
-    if (e - b < 2 || e[-1] != '"') return false;
-    const char* inner = b + 1;
-    const size_t raw = static_cast<size_t>(e - 1 - inner);
-    const unsigned quotes = count_quotes(inner, raw);
-    if (quotes & 1) return false;
-    len = raw - quotes / 2;
-    if (hash) {
-        if (!quotes) {
-            *hash = hash_bytes(inner, raw);
-        } else {
-            L.scratch.clear();
-            for (const char* x = inner; x < e - 1; ++x) {
-                L.scratch.push_back(*x);
-                if (*x == '"') ++x;  // second quote of the pair
-            }
-            *hash = hash_bytes(L.scratch.data(), L.scratch.size());
-        }
-    }
-    return true;
-}
-
-// Reads one record whose five separators (four commas, then its LF) are at offsets s[0..4] from
-// base. Returns the start of the next record, or nullptr when anything is not as expected, in
-// which case the caller parses the record byte by byte.
-inline const char* fast_record(const char* base, const uint32_t* s, const char* rec, Local& L, Fields& f) {
-    const char *c0 = base + s[0], *c1 = base + s[1], *c2 = base + s[2], *c3 = base + s[3], *lf = base + s[4];
-    if (*c0 != ',' || *c1 != ',' || *c2 != ',' || *c3 != ',' || *lf != '\n') return nullptr;
-    const size_t id_len = static_cast<size_t>(c0 - rec), region_len = static_cast<size_t>(c3 - c2 - 1);
-    if (id_len < 1 || id_len > 8 || region_len < 1 || region_len > 8) return nullptr;
-    f.id = parse_digits(rec, id_len);
-    f.region = parse_digits(c2 + 1, region_len);
-    if (f.id == UINT64_MAX || f.region == UINT64_MAX) return nullptr;
-    if (!text_field(c0 + 1, c1, L, f.name_len, &f.name_hash) || !text_field(c1 + 1, c2, L, f.note_len, nullptr)) return nullptr;
-    // amount: [-]digits '.' two digits, then an optional CR
-    const char* a = c3 + 1;
-    const char* ae = lf;
-    if (ae > a && ae[-1] == '\r') --ae;
-    if (ae - a < 4 || ae[-3] != '.') return nullptr;
-    const bool neg = *a == '-';
-    a += neg;
-    const size_t whole_len = static_cast<size_t>(ae - 3 - a);
-    if (whole_len < 1 || whole_len > 8) return nullptr;
-    const uint64_t whole = parse_digits(a, whole_len);
-    const unsigned d1 = static_cast<unsigned>(ae[-2] - '0'), d2 = static_cast<unsigned>(ae[-1] - '0');
-    if (whole == UINT64_MAX || d1 > 9 || d2 > 9) return nullptr;
-    const int64_t cents = static_cast<int64_t>(whole * 100 + d1 * 10 + d2);
-    f.cents = neg ? -cents : cents;
-    return lf + 1;
-}
-
-constexpr size_t kWindow = 16384;  // bytes of the file whose structure is indexed at a time
-
 const char* parse_range(const char* p, const char* stop, const char* end, const std::vector<uint16_t>& region_group,
                         uint16_t unmatched, Local& L, NameSet& names) {
     // The names of 16 records are added together: the table slots and the bitset words are cache
@@ -350,43 +199,41 @@ const char* parse_range(const char* p, const char* stop, const char* end, const 
         for (int k = 0; k < batched; ++k) names.set(batch_group[k], batch_id[k]);
         batched = 0;
     };
-    auto commit = [&](const Fields& f) {
-        uint16_t g = f.region < region_group.size() ? region_group[f.region] : kNoGroup;
+    while (p < stop) {
+        if (static_cast<uint8_t>(p[0]) == 0xEF && static_cast<uint8_t>(p[1]) == 0xBB && static_cast<uint8_t>(p[2]) == 0xBF)
+            p += 3;  // byte order mark at the start of a record
+        const uint64_t id = read_digits(p);
+        ++p;
+        size_t name_len, note_len;
+        uint64_t name_hash;
+        scan_text(p, end, L, name_len, &name_hash);
+        ++p;
+        scan_text(p, end, L, note_len, nullptr);  // only the note's length matters
+        ++p;
+        const uint64_t region = read_digits(p);
+        ++p;
+        const bool neg = *p == '-';
+        p += neg;
+        const uint64_t whole = read_digits(p);
+        const uint64_t frac = static_cast<uint64_t>(p[1] - '0') * 10 + static_cast<uint64_t>(p[2] - '0');
+        p += 3;
+        if (*p == '\r') ++p;
+        if (p < end && *p == '\n') ++p;
+        const int64_t cents = neg ? -static_cast<int64_t>(whole * 100 + frac) : static_cast<int64_t>(whole * 100 + frac);
+
+        uint16_t g = region < region_group.size() ? region_group[region] : kNoGroup;
         if (g == kNoGroup) g = unmatched;
         Agg& a = L.agg[g];
         ++a.count;
-        a.id_sum += f.id;
-        a.sum += f.cents;
-        a.min = std::min(a.min, f.cents);
-        a.max = std::max(a.max, f.cents);
-        a.name_bytes += f.name_len;
-        a.note_bytes += f.note_len;
-        batch_hash[batched] = f.name_hash;
+        a.id_sum += id;
+        a.sum += cents;
+        a.min = std::min(a.min, cents);
+        a.max = std::max(a.max, cents);
+        a.name_bytes += name_len;
+        a.note_bytes += note_len;
+        batch_hash[batched] = name_hash;
         batch_group[batched] = g;
         if (++batched == kBatch) flush();
-    };
-    std::vector<uint32_t> index(kWindow);
-    Fields f;
-    while (p < stop) {
-        // Fast path: find the separators of a whole window at once, then read the records in it.
-        // The window ends 64 bytes before the end of the file, so no read goes past it.
-        size_t done = 0;
-        if (static_cast<size_t>(end - p) >= kWindow + 64) {
-            const size_t m = index_structure(p, kWindow, index.data());
-            const char* rec = p;
-            for (size_t si = 0; rec < stop && si + 5 <= m; si += 5) {
-                const char* next = fast_record(p, index.data() + si, rec, L, f);
-                if (!next) break;
-                commit(f);
-                rec = next;
-                ++done;
-            }
-            p = rec;
-        }
-        if (!done && p < stop) {  // a record the fast path did not take, or the end of the file
-            p = scalar_record(p, end, L, f);
-            commit(f);
-        }
     }
     flush();
     return p;
