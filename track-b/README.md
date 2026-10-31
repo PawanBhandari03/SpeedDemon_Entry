@@ -4,20 +4,27 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-One C++20 file, no libraries. The spec allows indexing only the terms the queries use, so `queries.txt` is parsed first and every distinct term gets a 64-bit key and an id in a small open-addressing table.
+One C++20 file, no libraries. The spec allows indexing only the terms the queries use, so `queries.txt` is parsed first and every distinct term gets a 64-bit key and an id in a small open-addressing table. The table keeps its keys in a dense array of their own, so the probe that most tokens make stays in cache.
 
-The corpus is memory-mapped and cut into one chunk of lines per CPU thread; every chunk after the first starts at a document id that is a multiple of 64, so threads never share a bitset word. Each thread tokenizes its lines with a 256-entry byte-class table (a-z, 0-9 and A-Z folded to lower case are token bytes, everything else separates), hashing each token as it is read, and looks the hash up in the term table. The table keeps its keys in their own dense array (1 MB for the 75,747 query terms of seed 1), so the probe that almost every token makes stays in the L2 cache.
+The corpus is memory-mapped and cut into one chunk of lines per CPU thread; every chunk after the first starts at a document id that is a multiple of 64, so two threads never write the same bitset word. Each thread tokenizes its lines with a 256-entry byte-class table (a-z, 0-9 and A-Z folded to lower case are token bytes), and hashes each token eight bytes at a time.
 
-A short sample (the first 1/32 of every chunk) estimates each term's document count first. Terms expected in more than 4,096 documents are dense: the scan sets their bit in a per-term bitset directly. For the other terms it records (term, document) once per document; because each thread owns a contiguous range of documents, the records are scattered into one flat posting array and every term's list comes out sorted without any sorting. The line offset of every document is kept for phrase checks.
+A short sample (the first 1/32 of every chunk) estimates each term's document count. Terms expected in more than 4,096 documents are dense, and the rest are rare:
 
-A BOOL query runs left to right on a working bitset: AND, OR and NOT against a dense term are word-wise operations, and against a rare term they touch only that term's list. The count, the id sum and the ten smallest ids are read from the final bitset.
+- **Dense terms** (the common words, most of the corpus tokens) have their own tiny table that is checked first. The thread keeps one word per dense term for the 64 documents in progress and writes those words into the term's bitset once per 64 documents. Setting a bit in the bitsets directly would be a cache miss and a TLB miss per (document, term).
+- **Rare terms** record (term, document) once per document in a 4-byte stream. The rarest-looking term of every phrase also keeps each occurrence with its file offset. Because each thread owns a contiguous range of documents, the streams are scattered into one flat posting array and every term's list comes out sorted without sorting.
 
-A PHRASE query takes the term with the fewest documents, tests each of its documents against the other terms (bitset test or binary search), and for the survivors tokenizes the document again, comparing each token's key with the phrase's keys through a ring of the last k keys, so no positions are stored and no table lookup is needed. Queries are answered in parallel and the output is joined in order.
+A BOOL query runs left to right on a working bitset: AND, OR and NOT against a dense term are word-wise operations, and against a rare term they touch only that term's list. The count, the id sum and the ten smallest ids come from the final bitset.
+
+A PHRASE query is driven by its rarest term. A document is a candidate when it holds every term (a bitset test or a binary search per term). For a rare driver, only the tokens around each stored occurrence are compared with the phrase's keys, at every phrase position the driver can take. When every term is common, the candidate document is tokenized and compared through a ring of the last k keys. Queries are answered in parallel and the output is joined in order.
 
 ## Dependencies
 
 None.
 
+## What did not work
+
+A bit filter in front of the term table, evaluating BOOL queries on sorted lists, an AVX2 tokenizer, a prefetch queue for the table lookups, a sparser table, and a lazily allocated posting array (less memory on the test laptop, more on the board) were all measured and dropped. See [PERF.md](PERF.md).
+
 ## With another 24 hours
 
-Replace the double tokenization with an indexed pass that keeps positions only for the few phrase terms, intersect lists with galloping and SIMD instead of per-document probes, and shrink the pass-1 record buffers to cut peak memory.
+Cut the memory peak at the posting scatter (the term streams and the posting array exist at the same time) by splitting the streams by term range and freeing each after it is scattered, and intersect lists with galloping and SIMD instead of per-document probes.
