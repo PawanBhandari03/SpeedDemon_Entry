@@ -146,14 +146,20 @@ struct Worker {
         return static_cast<uint32_t>(((slabs.size() - 1) << kSlabShift) | used++);
     }
 
-    void add(size_t hour, uint16_t ep, uint32_t lat, uint8_t err) {
+    // The row of one hour, created on first use. The scan holds the returned reference for as long as
+    // the hour does not change, so a line costs one indexed load instead of the two that resolving the
+    // row every time did (the slot of the hour, then the row itself).
+    std::vector<Cell>& row(size_t hour) {
         int s = slot_of[hour];
         if (s < 0) {
             s = static_cast<int>(rows.size());
             slot_of[hour] = static_cast<int8_t>(s);
             rows.emplace_back();
         }
-        std::vector<Cell>& row = rows[static_cast<size_t>(s)];
+        return rows[static_cast<size_t>(s)];
+    }
+
+    void add(std::vector<Cell>& row, uint16_t ep, uint32_t lat, uint8_t err) {
         if (ep >= row.size()) row.resize(std::max<size_t>(ep + 1, row.size() * 2));
         Cell& c = row[ep];
         const size_t pos = c.count % kBlockValues;
@@ -217,7 +223,8 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
     // Neighbouring lines almost always share their hour, so the date arithmetic runs only when
     // the "YYYY-MM-DDTHH" prefix changes (compared as two overlapping 8-byte words).
     uint64_t prev_a = 0, prev_b = 0;
-    int64_t rel = 0;
+    int64_t rel = 0, cur_hour = -1;
+    std::vector<Cell>* rowp = nullptr;
     while (b < e) {
         // ts: 2026-10-30T18:07:18.569411Z  (always 27 bytes)
         uint64_t ta, tb;
@@ -253,7 +260,8 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
             while (*q != '\n') lat = lat * 10 + static_cast<uint32_t>(*q++ - '0');
             next = q + 1;
         }
-        w.add(static_cast<size_t>(rel), w.table.intern(ep, ep_len), lat, err);
+        if (rel != cur_hour) { rowp = &w.row(static_cast<size_t>(rel)); cur_hour = rel; }
+        w.add(*rowp, w.table.intern(ep, ep_len), lat, err);
         b = next;
     }
 }
