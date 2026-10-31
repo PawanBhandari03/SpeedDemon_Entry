@@ -1,17 +1,18 @@
 // Speed Demon 2026, Track A (Ingest): requests.log -> summary.txt
 //
 // Plan: map the file, cut it into one chunk per thread at newline boundaries, and let every
-// thread scan its chunk once with hand-written parsing. A thread only appends compact
-// (endpoint, hour, latency, is_error) records. After the threads join we give every
-// endpoint a global id in byte order and bucket the latencies by (hour, endpoint) with a
-// counting sort that every thread helps with. The bucket index is hour-major, so walking the
-// buckets in order is already the output order: each thread takes a run of buckets, picks
-// p50/p95/p99 with nth_element and formats its lines, and the runs are written in order.
+// thread scan its chunk once with hand-written parsing. A thread files each latency into small
+// blocks chained per (hour, endpoint) bucket, so nothing is copied again later. After the threads
+// join we give every endpoint a global id in byte order. The output is hour-major, so each hour is
+// one task: it gathers the blocks of all threads for every endpoint, picks p50/p95/p99 with a
+// sort or nth_element, formats the lines, and the hours are written in order.
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -27,13 +28,6 @@
 namespace {
 
 constexpr int kHours = 72;  // the span is fixed by the spec: 2026-10-30T18 .. 2026-11-02T17
-
-struct Rec {
-    uint16_t ep;   // thread-local endpoint id, then the global one
-    uint8_t hour;  // 0..71 since 2026-10-30T18:00Z
-    uint8_t err;   // 1 if status is 5xx
-    uint32_t lat;
-};
 
 // Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
 int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
@@ -93,15 +87,76 @@ struct EpTable {
     }
 };
 
-// A worker counts its records per (local endpoint, hour) while parsing, so no extra pass over the
-// records is needed. calloc keeps the untouched part of the arrays out of memory.
+// A bucket is one (hour, endpoint) pair. A worker keeps, per bucket, a count, the 5xx count and a chain of
+// small blocks that hold its latencies: 7 values and a link to the previous block, 32 bytes. Blocks come
+// from big slabs, so one record costs one counter update and one store, and no record is ever copied
+// again: the percentile step reads the blocks of every worker for a bucket straight from where they are.
+constexpr size_t kBlockValues = 7;
+constexpr unsigned kSlabShift = 14;  // 16384 blocks (512 KB) per slab
+constexpr size_t kSlabBlocks = size_t(1) << kSlabShift;
+
+struct Cell {
+    uint32_t count = 0, errs = 0;
+    uint32_t tail = 0;  // block with the newest values (block 0 is never handed out)
+};
+
 struct Worker {
     EpTable table;
-    std::vector<Rec> recs;
-    uint32_t* cursor = static_cast<uint32_t*>(calloc(EpTable::kCap * kHours, 4));  // count, then write position
-    uint32_t* errs = static_cast<uint32_t*>(calloc(EpTable::kCap * kHours, 4));    // 5xx count
-    std::string out;
+    int8_t slot_of[kHours];               // row of each hour this worker has seen, -1 if none
+    std::vector<std::vector<Cell>> rows;  // [row of an hour][local endpoint]; a chunk spans only a few hours
+    std::vector<uint32_t*> slabs;
+    size_t used = kSlabBlocks;  // blocks taken from the newest slab
     bool bad = false;
+
+    Worker() { memset(slot_of, -1, sizeof slot_of); }
+    Worker(const Worker&) = delete;
+    Worker& operator=(const Worker&) = delete;
+    ~Worker() {
+        for (uint32_t* s : slabs) free(s);
+    }
+
+    uint32_t* block(uint32_t id) const { return slabs[id >> kSlabShift] + size_t(id & (kSlabBlocks - 1)) * 8; }
+
+    uint32_t new_block() {
+        if (used == kSlabBlocks) {
+            slabs.push_back(static_cast<uint32_t*>(aligned_alloc(64, kSlabBlocks * 32)));
+            used = slabs.size() == 1 ? 1 : 0;
+        }
+        return static_cast<uint32_t>(((slabs.size() - 1) << kSlabShift) | used++);
+    }
+
+    void add(size_t hour, uint16_t ep, uint32_t lat, uint8_t err) {
+        int s = slot_of[hour];
+        if (s < 0) {
+            s = static_cast<int>(rows.size());
+            slot_of[hour] = static_cast<int8_t>(s);
+            rows.emplace_back();
+        }
+        std::vector<Cell>& row = rows[static_cast<size_t>(s)];
+        if (ep >= row.size()) row.resize(std::max<size_t>(ep + 1, row.size() * 2));
+        Cell& c = row[ep];
+        const size_t pos = c.count % kBlockValues;
+        uint32_t* blk;
+        if (pos == 0) {
+            const uint32_t b = new_block();
+            blk = block(b);
+            blk[kBlockValues] = c.tail;
+            c.tail = b;
+        } else {
+            blk = block(c.tail);
+        }
+        blk[pos] = lat;
+        ++c.count;
+        c.errs += err;
+    }
+
+    // The cell of (hour, local endpoint), or null when this worker saw no such record.
+    const Cell* cell(size_t hour, uint32_t local_ep) const {
+        const int s = slot_of[hour];
+        if (s < 0 || local_ep == UINT32_MAX) return nullptr;
+        const std::vector<Cell>& row = rows[static_cast<size_t>(s)];
+        return local_ep < row.size() ? &row[local_ep] : nullptr;
+    }
 };
 
 // Index of the first space byte in the 8 bytes w, or 8 if there is none.
@@ -151,7 +206,6 @@ inline const char* fast_fields(const char* q, const char*& ep, size_t& ep_len, u
 }
 
 void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
-    w.recs.reserve(static_cast<size_t>(e - b) / 70 + 16);
     // Neighbouring lines almost always share their hour, so the date arithmetic runs only when
     // the "YYYY-MM-DDTHH" prefix changes (compared as two overlapping 8-byte words).
     uint64_t prev_a = 0, prev_b = 0;
@@ -166,7 +220,10 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
             prev_b = tb;
             const int64_t y = (b[0] - '0') * 1000 + (b[1] - '0') * 100 + dig2(b + 2);
             rel = days_from_civil(y, dig2(b + 5), dig2(b + 8)) * 24 + dig2(b + 11) - base_hour;
-            if (rel < 0 || rel >= kHours) w.bad = true;
+            if (rel < 0 || rel >= kHours) {
+                w.bad = true;  // the run fails below; keep the index valid until then
+                rel = 0;
+            }
         }
         const char* q = b + 28;  // method
         const char* ep;
@@ -193,10 +250,7 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
             while (*q != '\n') lat = lat * 10 + static_cast<uint32_t>(*q++ - '0');
             next = q + 1;
         }
-        const uint16_t id = w.table.intern(ep, ep_len);
-        w.recs.push_back({id, static_cast<uint8_t>(rel), err, lat});
-        ++w.cursor[size_t(id) * kHours + static_cast<size_t>(rel)];
-        w.errs[size_t(id) * kHours + static_cast<size_t>(rel)] += err;
+        w.add(static_cast<size_t>(rel), w.table.intern(ep, ep_len), lat, err);
         b = next;
     }
 }
@@ -263,44 +317,18 @@ int main(int argc, char** argv) {
     parallel(nt, [&](int i) { scan(cut[i], std::max(cut[i], cut[i + 1]), base_hour, workers[i]); });
     for (auto& w : workers) if (w.bad) return 1;
 
-    // Global endpoint ids, assigned in byte order.
+    // Global endpoint ids, assigned in byte order, and for every worker the map from the global id
+    // back to its local one (UINT32_MAX when the worker never saw the endpoint).
     std::vector<std::string_view> eps;
     for (auto& w : workers) eps.insert(eps.end(), w.table.names.begin(), w.table.names.end());
     std::sort(eps.begin(), eps.end());
     eps.erase(std::unique(eps.begin(), eps.end()), eps.end());
     const size_t E = eps.size();
-    const size_t G = static_cast<size_t>(kHours) * E;
-
-    // Bucket g = hour * E + global endpoint. Add up the workers' counts per bucket, then turn each
-    // worker's count into its write position inside the bucket (workers in order).
-    std::vector<std::vector<uint32_t>> remap(nt);
+    std::vector<std::vector<uint32_t>> local_of(nt, std::vector<uint32_t>(E, UINT32_MAX));
     for (int i = 0; i < nt; ++i)
-        for (auto sv : workers[i].table.names)
-            remap[i].push_back(static_cast<uint32_t>(std::lower_bound(eps.begin(), eps.end(), sv) - eps.begin()));
-    std::vector<uint32_t> start(G + 1, 0), errs(G, 0);
-    for (int i = 0; i < nt; ++i)
-        for (size_t lep = 0; lep < remap[i].size(); ++lep)
-            for (size_t h = 0; h < kHours; ++h) {
-                const size_t g = h * E + remap[i][lep];
-                start[g + 1] += workers[i].cursor[lep * kHours + h];
-                errs[g] += workers[i].errs[lep * kHours + h];
-            }
-    for (size_t g = 0; g < G; ++g) start[g + 1] += start[g];
-    std::vector<uint32_t> running(start.begin(), start.end() - 1);
-    for (int i = 0; i < nt; ++i)
-        for (size_t lep = 0; lep < remap[i].size(); ++lep)
-            for (size_t h = 0; h < kHours; ++h) {
-                uint32_t& c = workers[i].cursor[lep * kHours + h];
-                const uint32_t n = c;
-                c = running[h * E + remap[i][lep]];
-                running[h * E + remap[i][lep]] += n;
-            }
-    std::vector<uint32_t> lats(start[G]);
-    parallel(nt, [&](int i) {
-        Worker& w = workers[i];
-        for (const Rec& r : w.recs) lats[w.cursor[size_t(r.ep) * kHours + r.hour]++] = r.lat;
-        std::vector<Rec>().swap(w.recs);
-    });
+        for (size_t lep = 0; lep < workers[i].table.names.size(); ++lep)
+            local_of[i][static_cast<size_t>(std::lower_bound(eps.begin(), eps.end(), workers[i].table.names[lep]) - eps.begin())] =
+                static_cast<uint32_t>(lep);
 
     char hourstr[kHours][16];
     for (int h = 0; h < kHours; ++h) {
@@ -318,46 +346,80 @@ int main(int argc, char** argv) {
                  static_cast<long long>(t % 24));
     }
 
-    // Each worker takes a run of buckets holding about the same number of latencies, picks the
-    // percentiles (nearest rank) and formats its lines.
-    std::vector<size_t> bound(nt + 1, G);
-    bound[0] = 0;
-    for (int i = 1; i < nt; ++i)
-        bound[i] = static_cast<size_t>(std::lower_bound(start.begin(), start.end(), static_cast<uint32_t>(uint64_t(start[G]) * i / nt)) - start.begin());
-    parallel(nt, [&](int i) {
-        std::string& o = workers[i].out;
-        o.reserve((bound[i + 1] - bound[i]) * 90);
+    // One task per hour, handed out to the threads in turn. For every endpoint the task collects the
+    // latencies of all workers, picks the percentiles (nearest rank) and formats the line. The output
+    // order is hour-major with the endpoints in byte order, so a finished hour is written as soon as all
+    // the hours before it are, and its text is freed.
+    std::vector<std::string> hour_out(kHours);
+    std::vector<uint8_t> hour_done(kHours, 0);
+    std::mutex write_mutex;
+    int next_write = 0;
+    std::atomic<int> next_hour{0};
+    parallel(nt, [&](int) {
+        std::vector<uint32_t> vals;
         char line[256];
-        for (size_t g = bound[i]; g < bound[i + 1]; ++g) {
-            const size_t n = start[g + 1] - start[g];
-            if (!n) continue;
-            uint32_t* v = lats.data() + start[g];
-            const size_t r99 = (99 * n + 99) / 100, r95 = (95 * n + 99) / 100, r50 = (50 * n + 99) / 100;
-            if (n <= 64) {
-                // Most buckets are small: a plain sort of a few values beats three selections.
-                std::sort(v, v + n);
-            } else {
-                // Each selection leaves the smaller ranks in front, so the next one searches less.
-                std::nth_element(v, v + r99 - 1, v + n);
-                std::nth_element(v, v + r95 - 1, v + r99);
-                std::nth_element(v, v + r50 - 1, v + r95);
+        for (int h; (h = next_hour.fetch_add(1)) < kHours;) {
+            std::string& o = hour_out[static_cast<size_t>(h)];
+            o.reserve(E * 80);
+            for (size_t e = 0; e < E; ++e) {
+                size_t n = 0;
+                uint64_t errs = 0;
+                for (int i = 0; i < nt; ++i)
+                    if (const Cell* c = workers[i].cell(static_cast<size_t>(h), local_of[i][e])) {
+                        n += c->count;
+                        errs += c->errs;
+                    }
+                if (!n) continue;
+                vals.resize(n);
+                size_t k = 0;
+                for (int i = 0; i < nt; ++i) {
+                    const Cell* c = workers[i].cell(static_cast<size_t>(h), local_of[i][e]);
+                    if (!c || !c->count) continue;
+                    size_t left = c->count;
+                    size_t take = (left - 1) % kBlockValues + 1;  // the newest block may be partly filled
+                    for (uint32_t id = c->tail; left;) {
+                        const uint32_t* blk = workers[i].block(id);
+                        memcpy(&vals[k], blk, take * sizeof(uint32_t));
+                        k += take;
+                        left -= take;
+                        id = blk[kBlockValues];
+                        take = kBlockValues;
+                    }
+                }
+                uint32_t* v = vals.data();
+                const size_t r99 = (99 * n + 99) / 100, r95 = (95 * n + 99) / 100, r50 = (50 * n + 99) / 100;
+                if (n <= 64) {
+                    // Most buckets are small: a plain sort of a few values beats three selections.
+                    std::sort(v, v + n);
+                } else {
+                    // Each selection leaves the smaller ranks in front, so the next one searches less.
+                    std::nth_element(v, v + r99 - 1, v + n);
+                    std::nth_element(v, v + r95 - 1, v + r99);
+                    std::nth_element(v, v + r50 - 1, v + r95);
+                }
+                char* p = line;
+                memcpy(p, hourstr[h], 13); p += 13;  // YYYY-MM-DDTHH
+                memcpy(p, ":00:00Z ", 8); p += 8;
+                const std::string_view name = eps[e];
+                memcpy(p, name.data(), name.size()); p += name.size();
+                *p++ = ' '; p = put_u64(p, n);
+                *p++ = ' '; p = put_u64(p, v[r50 - 1]);
+                *p++ = ' '; p = put_u64(p, v[r95 - 1]);
+                *p++ = ' '; p = put_u64(p, v[r99 - 1]);
+                *p++ = ' '; p = put_u64(p, errs);
+                *p++ = ' '; p = put_u64(p, errs * 1000000ull / n);
+                *p++ = '\n';
+                o.append(line, static_cast<size_t>(p - line));
             }
-            char* p = line;
-            memcpy(p, hourstr[g / E], 13); p += 13;  // YYYY-MM-DDTHH
-            memcpy(p, ":00:00Z ", 8); p += 8;
-            const std::string_view name = eps[g % E];
-            memcpy(p, name.data(), name.size()); p += name.size();
-            *p++ = ' '; p = put_u64(p, n);
-            *p++ = ' '; p = put_u64(p, v[r50 - 1]);
-            *p++ = ' '; p = put_u64(p, v[r95 - 1]);
-            *p++ = ' '; p = put_u64(p, v[r99 - 1]);
-            *p++ = ' '; p = put_u64(p, errs[g]);
-            *p++ = ' '; p = put_u64(p, static_cast<uint64_t>(errs[g]) * 1000000ull / n);
-            *p++ = '\n';
-            o.append(line, static_cast<size_t>(p - line));
+            std::lock_guard<std::mutex> lock(write_mutex);
+            hour_done[static_cast<size_t>(h)] = 1;
+            for (; next_write < kHours && hour_done[static_cast<size_t>(next_write)]; ++next_write) {
+                std::string& done = hour_out[static_cast<size_t>(next_write)];
+                fwrite(done.data(), 1, done.size(), f);
+                std::string().swap(done);
+            }
         }
     });
-    for (auto& w : workers) fwrite(w.out.data(), 1, w.out.size(), f);
     fclose(f);
     return 0;
 }
