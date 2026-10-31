@@ -66,12 +66,13 @@ struct EpTable {
     std::vector<std::string_view> names;
 
     static uint64_t hash(const char* p, size_t n) {
+        // One multiply per eight bytes, with the avalanche left to the end: the extra shift-xor in
+        // the loop cost more than the reach it added.
         uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
         while (n >= 8) {
             uint64_t w;
             memcpy(&w, p, 8);
             h = (h ^ w) * 0xff51afd7ed558ccdull;
-            h ^= h >> 32;
             p += 8;
             n -= 8;
         }
