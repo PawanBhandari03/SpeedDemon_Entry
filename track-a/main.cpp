@@ -297,64 +297,6 @@ inline char* put_u64(char* o, uint64_t v) {
     return o + static_cast<size_t>(tmp + sizeof tmp - p);
 }
 
-// The output file, written with O_DIRECT when the filesystem allows it. The harness reads peak
-// memory from the run's cgroup, and pages of the output file that sit in the page cache are charged
-// to it: 10 MB of summary.txt is a quarter of this track's peak. Direct writes go straight to the
-// device, so those pages never exist. Everything is written through one aligned buffer in whole
-// 4 KB blocks, and the tail block is padded and then truncated away. If O_DIRECT is refused (some
-// filesystems refuse it) the same buffer is used with ordinary writes.
-struct Out {
-    int fd = -1;
-    bool direct = false;
-    char* buf = nullptr;
-    static constexpr size_t kCap = size_t(1) << 18;  // a multiple of 4096
-    size_t used = 0;
-    uint64_t total = 0;
-
-    bool open(const std::string& path) {
-        fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
-        direct = fd >= 0;
-        if (!direct) fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) return false;
-        if (direct && posix_memalign(reinterpret_cast<void**>(&buf), 4096, kCap) != 0) {
-            direct = false;
-            buf = nullptr;
-        }
-        if (!buf) buf = static_cast<char*>(malloc(kCap));
-        return buf != nullptr;
-    }
-    void write_all(const char* p, size_t n) {
-        while (n) {
-            const ssize_t w = ::write(fd, p, n);
-            if (w <= 0) return;
-            p += w;
-            n -= static_cast<size_t>(w);
-        }
-    }
-    void append(const char* p, size_t n) {
-        total += n;
-        while (n) {
-            const size_t take = std::min(n, kCap - used);
-            memcpy(buf + used, p, take);
-            used += take;
-            p += take;
-            n -= take;
-            if (used == kCap) { write_all(buf, kCap); used = 0; }
-        }
-    }
-    void close() {
-        const size_t whole = used & ~size_t(4095);
-        write_all(buf, whole);
-        if (used > whole) {  // pad the last partial block, then cut it back to the real length
-            memset(buf + used, 0, 4096 - (used - whole));
-            write_all(buf + whole, 4096);
-        }
-        if (direct && used > whole) ftruncate(fd, static_cast<off_t>(total));
-        ::close(fd);
-        free(buf);
-    }
-};
-
 int thread_count() {
     cpu_set_t set;
     if (sched_getaffinity(0, sizeof set, &set) == 0) {
@@ -387,9 +329,9 @@ int main(int argc, char** argv) {
     struct stat st;
     if (fstat(fd, &st) != 0) return 1;
     const size_t size = static_cast<size_t>(st.st_size);
-    Out ofile;
-    if (!ofile.open(out + "/summary.txt")) return 1;
-    if (size == 0) { ofile.close(); return 0; }
+    FILE* f = fopen((out + "/summary.txt").c_str(), "wb");
+    if (!f) return 1;
+    if (size == 0) { fclose(f); return 0; }
 
     const char* base = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
     if (base == MAP_FAILED) return 1;
@@ -532,12 +474,12 @@ int main(int argc, char** argv) {
             hour_done[static_cast<size_t>(h)] = 1;
             for (; next_write < kHours && hour_done[static_cast<size_t>(next_write)]; ++next_write) {
                 std::string& done = hour_out[static_cast<size_t>(next_write)];
-                ofile.append(done.data(), done.size());
+                fwrite(done.data(), 1, done.size(), f);
                 std::string().swap(done);
             }
             written.store(next_write, std::memory_order_release);
         }
     });
-    ofile.close();
+    fclose(f);
     return 0;
 }
