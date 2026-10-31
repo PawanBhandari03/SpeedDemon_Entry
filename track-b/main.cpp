@@ -20,6 +20,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <malloc.h>
 #include <unistd.h>
 
 namespace {
@@ -172,12 +173,16 @@ struct Dict {
     }
 };
 
+// The term streams are split by term id (term % kGroups), so the posting lists can be built, and the
+// streams freed, one group at a time: only one group's postings exist next to the remaining streams.
+constexpr unsigned kGroups = 4;
+
 struct Worker {
-    std::vector<uint32_t> terms;    // rare terms, once per document, in document order
-    std::vector<uint32_t> doc_end;  // per document of this worker: end of its run in terms
+    std::vector<uint32_t> terms[kGroups];    // rare terms, once per document, in document order
+    std::vector<uint32_t> doc_end[kGroups];  // per document of this worker: end of its run in terms
     uint32_t first_doc = 0;
-    std::vector<uint64_t> occ;      // (term << 32) | doc for every occurrence of a phrase-driver term
-    std::vector<uint32_t> offs;     // file offset of each of those occurrences
+    std::vector<uint64_t> occ[kGroups];      // (term << 32) | doc for every occurrence of a phrase-driver term
+    std::vector<uint32_t> offs[kGroups];     // file offset of each of those occurrences
     std::vector<uint32_t> count;    // list entries per term seen by this worker
     std::vector<uint32_t> last;     // last document seen for each term, to record a document once
 };
@@ -206,6 +211,10 @@ inline char* put_u64(char* o, uint64_t v) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Every big array gets its own mmap and goes back to the kernel when freed. By default glibc raises
+    // this threshold after the first big free, and later big arrays then come from arenas that keep
+    // their memory (and cannot be reused by another thread), so the freed streams below stayed resident.
+    mallopt(M_MMAP_THRESHOLD, 1 << 17);
     std::string data = "/data", outdir = "/out";
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--data")) data = argv[i + 1];
@@ -374,7 +383,7 @@ int main(int argc, char** argv) {
         std::vector<TermState> st(Q, TermState{UINT32_MAX, 0});
         const char* p = cut[i];
         const char* const e = std::max(cut[i], cut[i + 1]);
-        w.terms.reserve(static_cast<size_t>(e - p) / 64 + 16);
+        for (auto& v : w.terms) v.reserve(static_cast<size_t>(e - p) / 64 / kGroups + 16);
         bool first = true;
         while (p < e) {
             uint32_t doc = 0;
@@ -392,53 +401,60 @@ int main(int argc, char** argv) {
                 if (t == UINT32_MAX) return;
                 if (positional[t]) {
                     ++st[t].count;
-                    w.occ.push_back((static_cast<uint64_t>(t) << 32) | doc);
-                    w.offs.push_back(static_cast<uint32_t>(at - dbase));
+                    w.occ[t % kGroups].push_back((static_cast<uint64_t>(t) << 32) | doc);
+                    w.offs[t % kGroups].push_back(static_cast<uint32_t>(at - dbase));
                     return;
                 }
                 if (st[t].last == doc) return;
                 st[t].last = doc;
                 ++st[t].count;
-                w.terms.push_back(t);
+                w.terms[t % kGroups].push_back(t);
             });
-            w.doc_end.push_back(static_cast<uint32_t>(w.terms.size()));
+            for (unsigned g = 0; g < kGroups; ++g) w.doc_end[g].push_back(static_cast<uint32_t>(w.terms[g].size()));
         }
         if (!first) flush_block();
         for (uint32_t t = 0; t < Q; ++t) w.count[t] = st[t].count;
     });
 
-    // ---- Posting lists of the rare terms. The phrase-driver terms come first, so their offsets
-    // fit in one array of exactly their size. Each worker's entries go to their term's slice,
+    // ---- Posting lists of the rare terms. The phrase-driver terms come first in every group, so their
+    // offsets fit in one array of exactly their size. Each worker's entries go to their term's slice,
     // already in document order.
     std::vector<uint32_t> start(Q + 1, 0);
-    uint32_t run = 0, positional_total = 0;
+    uint32_t run[kGroups] = {}, positional_total[kGroups] = {};
     for (int pass = 0; pass < 2; ++pass) {
         for (uint32_t t = 0; t < Q; ++t) {
             if (positional[t] != (pass == 0)) continue;
-            start[t] = run;
+            uint32_t& r = run[t % kGroups];
+            start[t] = r;
             for (int i = 0; i < nt; ++i) {
                 const uint32_t c = workers[i].count[t];
-                workers[i].count[t] = run;  // becomes this worker's write cursor for the term
-                run += c;
+                workers[i].count[t] = r;  // becomes this worker's write cursor for the term
+                r += c;
             }
         }
-        if (pass == 0) positional_total = run;
+        if (pass == 0)
+            for (unsigned g = 0; g < kGroups; ++g) positional_total[g] = run[g];
     }
-    std::vector<uint32_t> postings(run), post_off(positional_total), df(Q);
-    parallel(nt, [&](int i) {
-        Worker& w = workers[i];
-        for (size_t k = 0, r = 0; k < w.doc_end.size(); ++k)
-            for (; r < w.doc_end[k]; ++r) postings[w.count[w.terms[r]]++] = w.first_doc + static_cast<uint32_t>(k);
-        for (size_t j = 0; j < w.occ.size(); ++j) {
-            const uint32_t at = w.count[w.occ[j] >> 32]++;
-            postings[at] = static_cast<uint32_t>(w.occ[j]);
-            post_off[at] = w.offs[j];
-        }
-        std::vector<uint32_t>().swap(w.terms);
-        std::vector<uint32_t>().swap(w.doc_end);
-        std::vector<uint64_t>().swap(w.occ);
-        std::vector<uint32_t>().swap(w.offs);
-    });
+    std::vector<uint32_t> postings[kGroups], post_off[kGroups];
+    for (unsigned g = 0; g < kGroups; ++g) {
+        postings[g].resize(run[g]);
+        post_off[g].resize(positional_total[g]);
+        parallel(nt, [&](int i) {
+            Worker& w = workers[i];
+            for (size_t k = 0, r = 0; k < w.doc_end[g].size(); ++k)
+                for (; r < w.doc_end[g][k]; ++r) postings[g][w.count[w.terms[g][r]]++] = w.first_doc + static_cast<uint32_t>(k);
+            for (size_t j = 0; j < w.occ[g].size(); ++j) {
+                const uint32_t at = w.count[w.occ[g][j] >> 32]++;
+                postings[g][at] = static_cast<uint32_t>(w.occ[g][j]);
+                post_off[g][at] = w.offs[g][j];
+            }
+            std::vector<uint32_t>().swap(w.terms[g]);
+            std::vector<uint32_t>().swap(w.doc_end[g]);
+            std::vector<uint64_t>().swap(w.occ[g]);
+            std::vector<uint32_t>().swap(w.offs[g]);
+        });
+    }
+    std::vector<uint32_t> df(Q);
     // After the scatter the last worker's cursor of a term is the end of the term's slice.
     parallel(nt, [&](int i) {
         for (uint32_t t = Q * uint64_t(i) / nt; t < Q * uint64_t(i + 1) / nt; ++t) {
@@ -451,7 +467,7 @@ int main(int argc, char** argv) {
     });
     auto term_set = [&](uint32_t t) {
         TermSet s;
-        s.list = postings.data() + start[t];
+        s.list = postings[t % kGroups].data() + start[t];
         s.n = df[t];
         s.bits = dense_of[t] >= 0 ? dense_bits.data() + static_cast<size_t>(dense_of[t]) * W : nullptr;
         return s;
@@ -538,7 +554,7 @@ int main(int argc, char** argv) {
                             if (!sd.bits) {
                                 // A rare driver lists every occurrence with its offset: check only the
                                 // k tokens around each one, at every phrase position the driver takes.
-                                const uint32_t* offs = post_off.data() + start[drv];
+                                const uint32_t* offs = post_off[drv % kGroups].data() + start[drv];
                                 uint32_t cur = UINT32_MAX;
                                 bool cur_ok = false, cur_found = false;
                                 for (uint32_t j = 0; j < sd.n; ++j) {
