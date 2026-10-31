@@ -27,7 +27,9 @@
 
 namespace {
 
-constexpr uint16_t kNoGroup = 0xFFFF;
+// Group ids are country indexes: at most 241 of them (240 countries plus _UNMATCHED), so these
+// tables hold bytes rather than halfwords. The biggest is region_id -> group, about 1M entries.
+constexpr uint8_t kNoGroup = 0xFF;
 
 struct Mapped {
     const char* p = nullptr;
@@ -119,11 +121,11 @@ struct Local {
     // 2 MB table. Id 0 is a free line, and region ids start at 1.
     struct Line {
         uint32_t id = 0;
-        uint16_t g = 0;
+        uint8_t g = 0;
         uint16_t pad = 0;
     } rc[1024] = {};
-    const std::vector<uint16_t>* region_group = nullptr;
-    uint16_t group_of(uint32_t r) {
+    const std::vector<uint8_t>* region_group = nullptr;
+    uint8_t group_of(uint32_t r) {
         Line& c = rc[r & 1023];
         if (c.id != r) {
             c.id = r;
@@ -253,7 +255,7 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     *hash = hash_bytes(L.scratch.data(), L.scratch.size());
 }
 
-const char* parse_range(const char* p, const char* stop, const char* end, uint16_t unmatched, Local& L,
+const char* parse_range(const char* p, const char* stop, const char* end, uint8_t unmatched, Local& L,
                         NameSet& names) {
     // The names of 16 records are added together: the table slots and the bitset words are cache
     // misses, and issuing all the prefetches first lets them overlap instead of stalling one by one.
@@ -296,7 +298,7 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint16
         if (p < end && *p == '\n') ++p;
         const int64_t cents = neg ? -static_cast<int64_t>(whole * 100 + frac) : static_cast<int64_t>(whole * 100 + frac);
 
-        uint16_t g = L.group_of(static_cast<uint32_t>(region));
+        uint8_t g = L.group_of(static_cast<uint32_t>(region));
         if (g == kNoGroup) g = unmatched;
         Agg& a = L.agg[g];
         ++a.count;
@@ -337,7 +339,7 @@ int main(int argc, char** argv) {
     // A code is three letters A-Z, so it indexes a 26^3 table directly, and that index order is
     // the bytewise order of the codes.
     std::vector<std::pair<uint32_t, uint16_t>> regions;  // (region_id, code index)
-    std::vector<uint16_t> code_group(26 * 26 * 26, kNoGroup);
+    std::vector<uint8_t> code_group(26 * 26 * 26, kNoGroup);
     uint32_t max_id = 0;
     {
         const char* p = static_cast<const char*>(memchr(reg.p, '\n', reg.n)) + 1;
@@ -352,11 +354,12 @@ int main(int argc, char** argv) {
             max_id = std::max(max_id, id);
         }
     }
-    std::vector<uint16_t> codes;  // group -> code index
+    std::vector<uint16_t> codes;  // group -> code index (the code itself is 26^3, so halfwords)
     for (uint16_t c = 0; c < code_group.size(); ++c)
-        if (code_group[c] != kNoGroup) { code_group[c] = static_cast<uint16_t>(codes.size()); codes.push_back(c); }
-    const uint16_t unmatched = static_cast<uint16_t>(codes.size());
-    std::vector<uint16_t> region_group(static_cast<size_t>(max_id) + 1, kNoGroup);
+        if (code_group[c] != kNoGroup) { code_group[c] = static_cast<uint8_t>(codes.size()); codes.push_back(c); }
+    if (codes.size() >= 254) return 1;  // the spec fixes 240 countries; more would not fit a byte
+    const uint8_t unmatched = static_cast<uint8_t>(codes.size());
+    std::vector<uint8_t> region_group(static_cast<size_t>(max_id) + 1, kNoGroup);
     for (auto& r : regions) region_group[r.first] = code_group[r.second];
     const size_t groups = codes.size() + 1;
 
