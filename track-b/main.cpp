@@ -449,25 +449,15 @@ int main(int argc, char** argv) {
         }
         if (pass == 0) positional_total = run;
     }
-    LazyArray<uint32_t> postings(run), post_off(positional_total);
-    std::vector<uint32_t> df(Q);
+    std::vector<uint32_t> postings(run), post_off(positional_total), df(Q);
     parallel(nt, [&](int i) {
         Worker& w = workers[i];
-        // The consumed front of each stream goes back to the kernel while the postings fill up, so
-        // the streams and the postings are never both fully resident.
-        uintptr_t up_terms = 0, up_occ = 0, up_offs = 0;
-        for (size_t k = 0, r = 0; k < w.doc_end.size(); ++k) {
+        for (size_t k = 0, r = 0; k < w.doc_end.size(); ++k)
             for (; r < w.doc_end[k]; ++r) postings[w.count[w.terms[r]]++] = w.first_doc + static_cast<uint32_t>(k);
-            if ((k & 4095) == 0) release_pages(w.terms.data(), r * sizeof(uint32_t), up_terms);
-        }
         for (size_t j = 0; j < w.occ.size(); ++j) {
             const uint32_t at = w.count[w.occ[j] >> 32]++;
             postings[at] = static_cast<uint32_t>(w.occ[j]);
             post_off[at] = w.offs[j];
-            if ((j & 32767) == 0) {
-                release_pages(w.occ.data(), j * sizeof(uint64_t), up_occ);
-                release_pages(w.offs.data(), j * sizeof(uint32_t), up_offs);
-            }
         }
         std::vector<uint32_t>().swap(w.terms);
         std::vector<uint32_t>().swap(w.doc_end);
