@@ -52,31 +52,6 @@ int thread_count() {
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
 
-// A zeroed array whose pages are committed only when they are written (calloc maps big blocks lazily).
-template <class T>
-struct LazyArray {
-    T* p;
-    explicit LazyArray(size_t n) : p(static_cast<T*>(calloc(n ? n : 1, sizeof(T)))) {}
-    ~LazyArray() { free(p); }
-    LazyArray(const LazyArray&) = delete;
-    LazyArray& operator=(const LazyArray&) = delete;
-    T& operator[](size_t i) { return p[i]; }
-    T* data() { return p; }
-    const T* data() const { return p; }
-};
-
-// Gives the whole pages of an array's consumed front back to the kernel, in steps of 1 MB.
-// `upto` is the address up to which pages were already given back.
-inline void release_pages(const void* base, size_t consumed_bytes, uintptr_t& upto) {
-    const uintptr_t first = (reinterpret_cast<uintptr_t>(base) + 4095) & ~uintptr_t(4095);
-    const uintptr_t hi = (reinterpret_cast<uintptr_t>(base) + consumed_bytes) & ~uintptr_t(4095);
-    if (upto < first) upto = first;
-    if (hi >= upto + (1u << 20)) {
-        madvise(reinterpret_cast<void*>(upto), hi - upto, MADV_DONTNEED);
-        upto = hi;
-    }
-}
-
 // Runs f(i) on threads 0..n-1 and waits for all of them.
 template <class F>
 void parallel(int n, F&& f) {
