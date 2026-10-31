@@ -101,23 +101,7 @@ struct Agg {
 struct Local {
     std::vector<Agg> agg;
     char esc[64];  // an unescaped name, padded so the hash can read eight bytes past it
-    // region id -> group, with the hot ids kept by a small direct-mapped cache: region popularity
-    // is skewed, so a cache this size answers a good share of the lookups without touching the
-    // 2 MB table. Id 0 is a free line, and region ids start at 1.
-    struct Line {
-        uint32_t id = 0;
-        uint8_t g = 0;
-        uint16_t pad = 0;
-    } rc[1024] = {};
-    const std::vector<uint8_t>* region_group = nullptr;
-    uint8_t group_of(uint32_t r) {
-        Line& c = rc[r & 1023];
-        if (c.id != r) {
-            c.id = r;
-            c.g = r < region_group->size() ? (*region_group)[r] : kNoGroup;
-        }
-        return c.g;
-    }
+    const std::vector<uint8_t>* region_group = nullptr;  // region id -> group (2 MB table)
 };
 
 // Distinct names. The spec draws names from a pool of 100,000 values, so every distinct name
@@ -311,11 +295,37 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
     // The names of 16 records are added together: the table slots and the bitset words are cache
     // misses, and issuing all the prefetches first lets them overlap instead of stalling one by one.
     constexpr int kBatch = 64;
+    struct Pending {
+        uint64_t id, region, name_hash;
+        int64_t cents;
+        uint32_t name_len, note_len;
+    } pend[kBatch];
     uint64_t batch_hash[kBatch];
     uint32_t batch_id[kBatch];
     uint16_t batch_group[kBatch];
     int batched = 0;
+    // A batch of 64 parsed records is finished together: the groups of all of them are looked up first
+    // (a random probe into a 2 MB table, so every probe is prefetched before the first is used), then the
+    // per-group sums are updated in one tight loop, then the names are added.
     auto flush = [&] {
+        const std::vector<uint8_t>& rg = *L.region_group;
+        for (int k = 0; k < batched; ++k)
+            if (pend[k].region < rg.size()) __builtin_prefetch(&rg[pend[k].region]);
+        for (int k = 0; k < batched; ++k) {
+            const Pending& r = pend[k];
+            uint8_t g = r.region < rg.size() ? rg[r.region] : kNoGroup;
+            g = g == kNoGroup ? unmatched : g;
+            Agg& a = L.agg[g];
+            ++a.count;
+            a.id_sum += r.id;
+            a.sum += r.cents;
+            a.min = std::min(a.min, r.cents);
+            a.max = std::max(a.max, r.cents);
+            a.name_bytes += r.name_len;
+            a.note_bytes += r.note_len;
+            batch_hash[k] = r.name_hash;
+            batch_group[k] = g;
+        }
         for (int k = 0; k < batched; ++k) names.prefetch_slot(batch_hash[k]);
         for (int k = 0; k < batched; ++k) {
             batch_id[k] = names.id_of(batch_hash[k]);
@@ -340,21 +350,7 @@ const char* parse_range(const char* p, const char* stop, const char* end, uint8_
         uint64_t region;
         int64_t cents;
         p = read_region_amount(p, end, region, cents);
-        // The region's group is a random probe into a 2 MB table.
-        if (region < L.region_group->size()) __builtin_prefetch(&(*L.region_group)[region]);
-
-        uint8_t g = L.group_of(static_cast<uint32_t>(region));
-        if (g == kNoGroup) g = unmatched;
-        Agg& a = L.agg[g];
-        ++a.count;
-        a.id_sum += id;
-        a.sum += cents;
-        a.min = std::min(a.min, cents);
-        a.max = std::max(a.max, cents);
-        a.name_bytes += name_len;
-        a.note_bytes += note_len;
-        batch_hash[batched] = name_hash;
-        batch_group[batched] = g;
+        pend[batched] = {id, region, name_hash, cents, static_cast<uint32_t>(name_len), static_cast<uint32_t>(note_len)};
         if (++batched == kBatch) flush();
     }
     flush();
