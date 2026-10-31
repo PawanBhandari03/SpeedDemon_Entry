@@ -385,7 +385,10 @@ int main(int argc, char** argv) {
         std::vector<TermState> st(Q, TermState{UINT32_MAX, 0});
         const char* p = cut[i];
         const char* const e = std::max(cut[i], cut[i + 1]);
-        for (auto& v : w.terms) v.reserve(static_cast<size_t>(e - p) / 64 / kGroups + 16);
+        // Entry density measured on the full corpus: about one recorded (term, document) pair per 92
+        // input bytes per group, so this reservation is a little generous and the streams do not
+        // reallocate (each reallocation copies the stream and briefly holds two of them).
+        for (auto& v : w.terms) v.reserve(static_cast<size_t>(e - p) / 80 + 64);
         bool first = true;
         while (p < e) {
             uint32_t doc = 0;
