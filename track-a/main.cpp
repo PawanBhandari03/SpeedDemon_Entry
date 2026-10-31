@@ -30,14 +30,6 @@ namespace {
 constexpr int kHours = 72;  // the span is fixed by the spec: 2026-10-30T18 .. 2026-11-02T17
 
 // Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<int64_t>(doe) - 719468;
-}
 
 inline int dig2(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 
@@ -219,7 +211,7 @@ inline const char* fast_fields(const char* q, const char*& ep, size_t& ep_len, u
     return q + end + 1;
 }
 
-void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
+void scan(const char* b, const char* e, Worker& w) {
     // Neighbouring lines almost always share their hour, so the date arithmetic runs only when
     // the "YYYY-MM-DDTHH" prefix changes (compared as two overlapping 8-byte words).
     uint64_t prev_a = 0, prev_b = 0;
@@ -233,8 +225,11 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
         if (ta != prev_a || tb != prev_b) {
             prev_a = ta;
             prev_b = tb;
-            const int64_t y = (b[0] - '0') * 1000 + (b[1] - '0') * 100 + dig2(b + 2);
-            rel = days_from_civil(y, dig2(b + 5), dig2(b + 8)) * 24 + dig2(b + 11) - base_hour;
+            // The spec fixes the span: 2026-10-30T18:00Z .. 2026-11-02T17:59:59Z. So the day is 30 or
+            // 31 October (0, 1) or 1 or 2 November (2, 3) and no calendar arithmetic is needed; the
+            // range check below still catches a timestamp outside it.
+            const int mm = dig2(b + 5), dd = dig2(b + 8);
+            rel = (mm == 10 ? dd - 30 : dd + 1) * 24 + dig2(b + 11) - 18;
             if (rel < 0 || rel >= kHours) {
                 w.bad = true;  // the run fails below; keep the index valid until then
                 rel = 0;
@@ -333,7 +328,6 @@ int main(int argc, char** argv) {
 
     const char* base = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
     if (base == MAP_FAILED) return 1;
-    const int64_t base_hour = days_from_civil(2026, 10, 30) * 24 + 18;
 
     // One chunk per thread, cut just after a newline.
     const int nt = size < (1u << 20) ? 1 : thread_count();
@@ -346,7 +340,7 @@ int main(int argc, char** argv) {
         cut[i] = nl ? nl + 1 : base + size;
     }
     std::vector<Worker> workers(nt);
-    parallel(nt, [&](int i) { scan(cut[i], std::max(cut[i], cut[i + 1]), base_hour, workers[i]); });
+    parallel(nt, [&](int i) { scan(cut[i], std::max(cut[i], cut[i + 1]), workers[i]); });
     for (auto& w : workers) if (w.bad) return 1;
 
     // Global endpoint ids, assigned in byte order, and for every worker the map from the global id
@@ -362,20 +356,15 @@ int main(int argc, char** argv) {
             local_of[i][static_cast<size_t>(std::lower_bound(eps.begin(), eps.end(), workers[i].table.names[lep]) - eps.begin())] =
                 static_cast<uint32_t>(lep);
 
+    // The four dates in the span, then the hour on the end: 13 characters each, "YYYY-MM-DDTHH".
+    static const char kDay[4][12] = {"2026-10-30T", "2026-10-31T", "2026-11-01T", "2026-11-02T"};
     char hourstr[kHours][16];
     for (int h = 0; h < kHours; ++h) {
-        const int64_t t = base_hour + h;
-        const int64_t z = (t / 24) + 719468;  // days since 0000-03-01
-        const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-        const unsigned doe = static_cast<unsigned>(z - era * 146097);
-        const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        const unsigned mp = (5 * doy + 2) / 153;
-        const unsigned d = doy - (153 * mp + 2) / 5 + 1;
-        const unsigned m = mp < 10 ? mp + 3 : mp - 9;
-        const int64_t yr = static_cast<int64_t>(yoe) + era * 400 + (m <= 2);
-        snprintf(hourstr[h], sizeof hourstr[h], "%04lld-%02u-%02uT%02lld", static_cast<long long>(yr), m, d,
-                 static_cast<long long>(t % 24));
+        const int t = 18 + h;
+        memcpy(hourstr[h], kDay[t / 24], 11);
+        hourstr[h][11] = static_cast<char>('0' + (t % 24) / 10);
+        hourstr[h][12] = static_cast<char>('0' + (t % 24) % 10);
+        hourstr[h][13] = 0;
     }
 
     // One task per hour, handed out to the threads in turn. For every endpoint the task collects the
