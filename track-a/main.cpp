@@ -384,10 +384,16 @@ int main(int argc, char** argv) {
     // latencies of all workers, picks the percentiles (nearest rank) and formats the line. The output
     // order is hour-major with the endpoints in byte order, so a finished hour is written as soon as all
     // the hours before it are, and its text is freed.
+    //
+    // A thread may only start an hour that is within kWindow of the next hour to be written. Without
+    // that bound the fast threads run ahead and every one of the 72 hour buffers (about 140 KB each)
+    // is live at once; with it, at most kWindow are, which is worth about 8 MB of peak memory.
+    constexpr int kWindow = 16;
     std::vector<std::string> hour_out(kHours);
     std::vector<uint8_t> hour_done(kHours, 0);
     std::mutex write_mutex;
     int next_write = 0;
+    std::atomic<int> written{0};
     std::atomic<int> next_hour{0};
     parallel(nt, [&](int) {
         // Grown, never shrunk: resize() would zero-fill the new elements of every group, and the copy
@@ -398,6 +404,7 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> row_len(nt, 0);
         char line[256];
         for (int h; (h = next_hour.fetch_add(1)) < kHours;) {
+            while (h - written.load(std::memory_order_acquire) > kWindow) std::this_thread::yield();
             std::string& o = hour_out[static_cast<size_t>(h)];
             o.reserve(E * 80);
             // The row of every worker for this hour changes once per hour, not once per endpoint:
@@ -470,6 +477,7 @@ int main(int argc, char** argv) {
                 fwrite(done.data(), 1, done.size(), f);
                 std::string().swap(done);
             }
+            written.store(next_write, std::memory_order_release);
         }
     });
     fclose(f);
