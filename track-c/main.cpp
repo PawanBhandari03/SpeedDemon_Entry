@@ -100,7 +100,6 @@ struct Agg {
 
 struct Local {
     std::vector<Agg> agg;
-    char esc[64];  // an unescaped name, padded so the hash can read eight bytes past it
     const std::vector<uint8_t>* region_group = nullptr;  // region id -> group (2 MB table)
 };
 
@@ -276,18 +275,11 @@ inline void scan_text(const char*& p, const char* end, Local& L, size_t& len, ui
     p = q + 1;
     const size_t raw = static_cast<size_t>(q - s);
     len = raw - escapes;
-    if (!hash) return;
-    if (!escapes) {
-        *hash = hash_bytes_padded(s, raw);
-        return;
-    }
-    size_t n = 0;
-    for (const char* x = s; x < q; ++x) {
-        L.esc[n++] = *x;
-        if (*x == '"') ++x;  // second quote of the pair
-    }
-    memset(L.esc + n, 0, 8);  // padding for the hash's eight-byte tail load
-    *hash = hash_bytes_padded(L.esc, n);
+    // The hash is taken over the text as written, doubled quotes included, and not over the unescaped
+    // value: escaping is a one-to-one encoding (every quote inside a field is doubled), so two names
+    // are equal exactly when their texts are, and the byte-by-byte unescaping of the one name in five
+    // that has a quote is not needed.
+    if (hash) *hash = hash_bytes_padded(s, raw);
 }
 
 const char* parse_range(const char* p, const char* stop, const char* end, uint8_t unmatched, Local& L,
