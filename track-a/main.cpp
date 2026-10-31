@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include <immintrin.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -110,6 +111,45 @@ inline unsigned space_in(uint64_t w) {
     return t ? static_cast<unsigned>(__builtin_ctzll(t)) / 8 : 8;
 }
 
+// Splits "METHOD ENDPOINT STATUS LATENCY<LF>" at q, which has at least 64 readable bytes, with
+// two 32-byte compares instead of byte loops: the bits of the space and LF masks give the field
+// ends. Returns the pointer just past the LF, or nullptr when the line does not fit in the
+// window or has an unexpected shape (the caller then parses it byte by byte).
+inline const char* fast_fields(const char* q, const char*& ep, size_t& ep_len, uint8_t& err, uint32_t& lat) {
+    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 32));
+    const __m256i space = _mm256_set1_epi8(' ');
+    const __m256i lf = _mm256_set1_epi8('\n');
+    const uint64_t spaces = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, space))) |
+                            static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, space)))) << 32;
+    const uint64_t lfs = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, lf))) |
+                         static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, lf)))) << 32;
+    if (!lfs) return nullptr;
+    const unsigned end = static_cast<unsigned>(__builtin_ctzll(lfs));  // index of the LF
+    uint64_t sp = spaces & ((uint64_t(1) << end) - 1);                // spaces before it
+    if (__builtin_popcountll(sp) != 3) return nullptr;
+    const unsigned s1 = static_cast<unsigned>(__builtin_ctzll(sp));
+    sp &= sp - 1;
+    const unsigned s2 = static_cast<unsigned>(__builtin_ctzll(sp));
+    sp &= sp - 1;
+    const unsigned s3 = static_cast<unsigned>(__builtin_ctzll(sp));
+    const unsigned digits = end - s3 - 1;  // latency digits
+    if (digits == 0 || digits > 8 || s3 != s2 + 4) return nullptr;
+    ep = q + s1 + 1;
+    ep_len = s2 - s1 - 1;
+    err = (q[s2 + 1] == '5');
+    // The last 8 bytes before the LF hold the digits at their top end; clear the bytes in front
+    // and turn the 8 digits (leading zeros included) into a number with three multiplications.
+    uint64_t v;
+    memcpy(&v, q + end - 8, 8);
+    v &= ~uint64_t(0) << ((8 - digits) * 8);
+    v = ((v & 0x0F0F0F0F0F0F0F0Full) * 2561) >> 8;
+    v = ((v & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
+    v = ((v & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
+    lat = static_cast<uint32_t>(v);
+    return q + end + 1;
+}
+
 void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
     w.recs.reserve(static_cast<size_t>(e - b) / 70 + 16);
     // Neighbouring lines almost always share their hour, so the date arithmetic runs only when
@@ -128,28 +168,36 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
             rel = days_from_civil(y, dig2(b + 5), dig2(b + 8)) * 24 + dig2(b + 11) - base_hour;
             if (rel < 0 || rel >= kHours) w.bad = true;
         }
-        const char* q = b + 28;                 // method
-        while (*q != ' ') ++q;
-        const char* ep = ++q;                   // endpoint, scanned 8 bytes at a time
-        for (;;) {
-            if (e - q < 8) { while (*q != ' ') ++q; break; }
-            uint64_t word;
-            memcpy(&word, q, 8);
-            const unsigned k = space_in(word);
-            q += k;
-            if (k < 8) break;
+        const char* q = b + 28;  // method
+        const char* ep;
+        size_t ep_len;
+        uint8_t err;
+        uint32_t lat;
+        const char* next = e - q >= 64 ? fast_fields(q, ep, ep_len, err, lat) : nullptr;
+        if (!next) {
+            while (*q != ' ') ++q;
+            ep = ++q;                   // endpoint, scanned 8 bytes at a time
+            for (;;) {
+                if (e - q < 8) { while (*q != ' ') ++q; break; }
+                uint64_t word;
+                memcpy(&word, q, 8);
+                const unsigned k = space_in(word);
+                q += k;
+                if (k < 8) break;
+            }
+            ep_len = static_cast<size_t>(q - ep);
+            ++q;
+            err = (*q == '5');          // status is always three digits
+            q += 4;
+            lat = 0;
+            while (*q != '\n') lat = lat * 10 + static_cast<uint32_t>(*q++ - '0');
+            next = q + 1;
         }
-        const size_t ep_len = static_cast<size_t>(q - ep);
-        ++q;
-        const uint8_t err = (*q == '5');        // status is always three digits
-        q += 4;
-        uint32_t lat = 0;
-        while (*q != '\n') lat = lat * 10 + static_cast<uint32_t>(*q++ - '0');
         const uint16_t id = w.table.intern(ep, ep_len);
         w.recs.push_back({id, static_cast<uint8_t>(rel), err, lat});
         ++w.cursor[size_t(id) * kHours + static_cast<size_t>(rel)];
         w.errs[size_t(id) * kHours + static_cast<size_t>(rel)] += err;
-        b = q + 1;
+        b = next;
     }
 }
 
