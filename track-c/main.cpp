@@ -411,23 +411,28 @@ int main(int argc, char** argv) {
         locals.resize(nt);
         for (auto& L : locals) { L.agg.assign(groups, Agg()); L.region_group = &region_group; }
 
-        std::vector<const char*> chunk(nt + 1);
-        for (int i = 0; i <= nt; ++i) chunk[i] = base + rec.n * static_cast<size_t>(i) / static_cast<size_t>(nt);
+        // The file is cut into four chunks per thread, handed out in turn: a fixed split gives every
+        // thread one chunk and the slowest thread sets the time, with small chunks the fast ones take more.
+        const int K = nt == 1 ? 1 : nt * 4;
+        std::vector<const char*> chunk(K + 1);
+        for (int i = 0; i <= K; ++i) chunk[i] = base + rec.n * static_cast<size_t>(i) / static_cast<size_t>(K);
         const char* const hdr = static_cast<const char*>(memchr(base, '\n', rec.n)) + 1;  // skip BOM + header
 
         // Parses every thread's records from the given first-record starts. Returns true when
         // each thread stopped exactly where the next one started, i.e. the starts were right.
         auto parse_all = [&](const std::vector<const char*>& starts) {
-            std::vector<const char*> ends(nt);
+            std::vector<const char*> ends(K);
+            std::atomic<int> next_chunk{0};
             std::vector<std::thread> th;
             for (int i = 0; i < nt; ++i)
                 th.emplace_back([&, i] {
-                    ends[i] = starts[i] < starts[i + 1]
-                                  ? parse_range(starts[i], starts[i + 1], end, unmatched, locals[i], names)
-                                  : starts[i];
+                    for (int c; (c = next_chunk.fetch_add(1)) < K;)
+                        ends[c] = starts[c] < starts[c + 1]
+                                      ? parse_range(starts[c], starts[c + 1], end, unmatched, locals[i], names)
+                                      : starts[c];
                 });
             for (auto& t : th) t.join();
-            for (int i = 0; i < nt; ++i)
+            for (int i = 0; i < K; ++i)
                 if (ends[i] != starts[i + 1]) return false;
             return true;
         };
@@ -435,9 +440,9 @@ int main(int argc, char** argv) {
         // Fast start finder. A newline inside a quoted note is always followed by a lowercase
         // letter or a quote, and a record really starts after a newline followed by a digit (an
         // id) or a byte order mark (spec 2.2: ids are [1-9][0-9]*, notes are lowercase words).
-        std::vector<const char*> starts(nt + 1, end);
+        std::vector<const char*> starts(K + 1, end);
         starts[0] = hdr;
-        for (int i = 1; i < nt; ++i)
+        for (int i = 1; i < K; ++i)
             for (const char* x = std::max(chunk[i], hdr); x + 1 < end; ++x)
                 if (*x == '\n' && (static_cast<unsigned>(static_cast<uint8_t>(x[1]) - '0') < 10 || static_cast<uint8_t>(x[1]) == 0xEF)) {
                     starts[i] = x + 1;
@@ -450,10 +455,10 @@ int main(int argc, char** argv) {
             // says whether a chunk starts inside quotes, and start at a '\n' with an even count.
             for (auto& L : locals) L.agg.assign(groups, Agg());
             names.reset(groups);
-            std::vector<uint8_t> parity(nt, 0);
+            std::vector<uint8_t> parity(K, 0);
             {
                 std::vector<std::thread> th;
-                for (int i = 0; i < nt; ++i)
+                for (int i = 0; i < K; ++i)
                     th.emplace_back([&, i] {
                         size_t c = 0;
                         for (const char* x = chunk[i]; x < chunk[i + 1]; ++x) c += (*x == '"');
@@ -464,7 +469,7 @@ int main(int argc, char** argv) {
             std::fill(starts.begin(), starts.end(), end);
             starts[0] = hdr;
             uint8_t inside = parity[0];
-            for (int i = 1; i < nt; ++i) {
+            for (int i = 1; i < K; ++i) {
                 uint8_t q = inside;
                 for (const char* x = chunk[i]; x < end; ++x) {
                     if (*x == '"') q ^= 1;
