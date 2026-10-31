@@ -54,7 +54,7 @@ int thread_count() {
     cpu_set_t set;
     if (sched_getaffinity(0, sizeof set, &set) == 0) {
         const int n = CPU_COUNT(&set);
-        if (n > 0) return n;
+        if (n > 0) return std::max(1, n / 2);  // experiment: one thread per physical core (the CPU has two hardware threads per core)
     }
     return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
 }
