@@ -414,7 +414,7 @@ int main(int argc, char** argv) {
     }
     std::vector<Worker> workers(nt);
 
-    // ---- Estimate every term's document count from the first 1/32 of each chunk. A term
+    // ---- Estimate every term's document count from the first 1/64 of each chunk. A term
     // expected in more than kDenseDf documents is "dense": the scan sets its bits directly
     // instead of recording (term, document) pairs, which are most of the pairs.
     std::vector<uint32_t> sampled(nt, 0);
@@ -423,7 +423,7 @@ int main(int argc, char** argv) {
         w.count.assign(Q, 0);
         w.last.assign(Q, UINT32_MAX);
         const char* p = cut[i];
-        const char* const e = std::min(std::max(cut[i], cut[i + 1]), cut[i] + (cut[i + 1] - cut[i]) / 32);
+        const char* const e = std::min(std::max(cut[i], cut[i + 1]), cut[i] + (cut[i + 1] - cut[i]) / 64);
         uint32_t doc = 0;
         while (p < e) {
             p = tokenize_line(p, dend, [&](uint64_t key, const char*) {
