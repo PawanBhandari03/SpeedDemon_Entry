@@ -94,6 +94,20 @@ void parallel(int n, F&& f) {
     for (auto& t : th) t.join();
 }
 
+// A zeroed array whose pages are committed only when written, by whichever thread writes them
+// (calloc maps big blocks lazily), instead of being zero-filled by one thread up front.
+template <class T>
+struct LazyArray {
+    T* p;
+    explicit LazyArray(size_t n) : p(static_cast<T*>(calloc(n ? n : 1, sizeof(T)))) {}
+    ~LazyArray() { free(p); }
+    LazyArray(const LazyArray&) = delete;
+    LazyArray& operator=(const LazyArray&) = delete;
+    T& operator[](size_t i) { return p[i]; }
+    T* data() { return p; }
+    void swap(LazyArray& o) { std::swap(p, o.p); }
+};
+
 // Monotone priority queue for 32-bit keys (a radix heap). An entry (key << 32 | node) sits in
 // the bucket of the highest bit in which its key differs from the last key popped; Dijkstra
 // never pushes a key below that, so only the lowest non-empty bucket is ever redistributed.
@@ -235,37 +249,43 @@ int main(int argc, char** argv) {
         const char* nl = static_cast<const char*>(memchr(p - 1, '\n', static_cast<size_t>(end - (p - 1))));
         cut[i] = nl ? nl + 1 : end;
     }
-    std::vector<std::vector<Edge>> parts(nt);
+    // Every thread appends the edges it parses to a bucket per range of tail nodes. The owner of
+    // a range later builds that range's part of the CSR with plain writes: no atomic updates, whose
+    // cache misses cannot overlap, and every thread writes only inside its own ranges.
+    const int R = nt;
+    std::vector<std::vector<Edge>> parts(static_cast<size_t>(nt) * R);
+    std::vector<uint8_t> has_in(n, 0);  // a node with no in-edge can only be reached from itself
     parallel(nt, [&](int i) {
         const char* p = cut[i];
         const char* e = std::max(cut[i], cut[i + 1]);
-        auto& v = parts[i];
-        v.reserve(static_cast<size_t>(e - p) / 12 + 16);
+        const size_t per = static_cast<size_t>(e - p) / 12 / R;
+        for (int r = 0; r < R; ++r) parts[static_cast<size_t>(i) * R + r].reserve(per + per / 4 + 16);
         while (p < e) {
             const uint32_t u = static_cast<uint32_t>(read_uint(p)); ++p;
             const uint32_t to = static_cast<uint32_t>(read_uint(p)); ++p;
             const uint32_t w = static_cast<uint32_t>(read_uint(p)); ++p;
-            v.push_back({u, to, w});
+            parts[static_cast<size_t>(i) * R + static_cast<size_t>(static_cast<uint64_t>(u) * R / n)].push_back({u, to, w});
+            std::atomic_ref<uint8_t>(has_in[to]).store(1, std::memory_order_relaxed);
         }
     });
 
-    // CSR build, all threads at once: out-degree counts, prefix sums, then each edge claims a
-    // slot in its tail's block. The order of arcs inside a block does not change any distance.
+    // CSR build: out-degree counts, prefix sums, then each edge takes a slot in its tail's block.
+    // The order of arcs inside a block does not change any distance.
     std::vector<uint32_t> off(n + 2, 0);
-    std::vector<uint8_t> has_in(n, 0);  // a node with no in-edge can only be reached from itself
-    parallel(nt, [&](int i) {
-        for (const Edge& e : parts[i]) {
-            std::atomic_ref<uint32_t>(off[e.u + 2]).fetch_add(1, std::memory_order_relaxed);
-            std::atomic_ref<uint8_t>(has_in[e.v]).store(1, std::memory_order_relaxed);
-        }
+    parallel(nt, [&](int r) {
+        for (int t = 0; t < nt; ++t)
+            for (const Edge& e : parts[static_cast<size_t>(t) * R + r]) ++off[e.u + 2];
     });
     for (uint64_t i = 2; i < n + 2; ++i) off[i] += off[i - 1];
     // off[u + 1] is now the start of u's block; claiming slots advances it to the block end,
     // which is the start of u + 1's block.
-    std::vector<Arc> arcs(m);
-    parallel(nt, [&](int i) {
-        for (const Edge& e : parts[i]) arcs[std::atomic_ref<uint32_t>(off[e.u + 1]).fetch_add(1, std::memory_order_relaxed)] = {e.v, e.w};
-        std::vector<Edge>().swap(parts[i]);
+    LazyArray<Arc> arcs(m);
+    parallel(nt, [&](int r) {
+        for (int t = 0; t < nt; ++t) {
+            auto& part = parts[static_cast<size_t>(t) * R + r];
+            for (const Edge& e : part) arcs[off[e.u + 1]++] = {e.v, e.w};
+            std::vector<Edge>().swap(part);
+        }
     });
 
     // Renumber the nodes in breadth-first order. The input ids are a random shuffle, so a
@@ -335,7 +355,7 @@ int main(int argc, char** argv) {
             off2[x + 1] = off2[x] + (off[order[x] + 1] - off[order[x]]);
             has_in2[x] = has_in[order[x]];
         }
-        std::vector<Arc> arcs2(m);
+        LazyArray<Arc> arcs2(m);
         parallel(nt, [&](int i) {
             for (uint64_t x = n * i / nt; x < n * (i + 1) / nt; ++x) {
                 uint32_t pos = off2[x];
