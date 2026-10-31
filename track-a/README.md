@@ -4,23 +4,23 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-One C++20 file, no libraries. The log is memory-mapped and cut into one chunk per available CPU thread, each chunk ending on a newline. Every thread scans its chunk once.
+One C++20 file, no libraries. The log is memory-mapped and cut into one chunk per available CPU thread, each cut on a newline. Every thread scans its chunk once and never copies a record again.
 
-- **Timestamp.** The date arithmetic runs only when the `YYYY-MM-DDTHH` prefix changes (compared as two overlapping 8-byte words), since neighbouring lines almost always share their hour.
-- **Fields.** The method, endpoint, status and latency boundaries come from two 32-byte AVX2 compares per line (bit masks of the spaces and the LF), and the latency is read with three multiplications (SWAR). A line that does not fit that shape takes a byte-by-byte path, so the result never depends on the fast path.
-- **Endpoints.** Each thread interns them in a small open-addressing table keyed by a 64-bit hash seeded with the length. Entries are matched by the hash and the length only: comparing the bytes costs a cold load from the first occurrence in the file, and a collision among about 2000 endpoints has a chance of about 1e-13.
-- **Records.** The thread appends an 8-byte record (endpoint, hour, latency, is-5xx) and counts it per (local endpoint, hour) in the same step, so no separate counting pass is needed.
+- **Timestamp.** The date arithmetic (Howard Hinnant's `days_from_civil`) runs only when the `YYYY-MM-DDTHH` prefix changes, compared as two overlapping 8-byte words, because neighbouring lines almost always share their hour.
+- **Fields.** The method, endpoint, status and latency boundaries come from two 32-byte AVX2 compares per line: the bit masks of the spaces and the LF give the field ends, and the latency is converted with three multiplications (SWAR). A line whose endpoint runs past that 64-byte window takes a byte-by-byte path, so the fast path is an optimisation and not a correctness assumption.
+- **Endpoints.** Each thread interns them in a 4096-slot open-addressing table of 16-byte entries keyed by a 64-bit hash seeded with the length, with a 256-entry direct-mapped cache in front of it for the endpoints that repeat. Entries are matched by hash and length only: comparing bytes costs a cold load from the first occurrence in the file, and a collision among about 2,000 endpoints has a chance of about 1e-13.
+- **Buckets.** A bucket is one (hour, endpoint) pair. Each thread keeps one row of buckets per hour it has seen, and each bucket holds a count, a 5xx count and a chain of 32-byte blocks (seven latencies and a link to the previous block) carved from 512 KB slabs. One record is therefore one counter update and one store, and no second pass over the data is needed to collect latencies.
 
-When the threads finish, endpoints get global ids in byte order, so the bucket index `hour * endpoints + endpoint` is already the required output order. The per-thread counts become write positions, and every thread scatters its records into one latency array. Each thread then takes a run of buckets holding about the same number of latencies, sorts the small ones (at most 64 values) or runs `nth_element` on the large ones, and formats its lines (nearest-rank p50, p95, p99). The output is written in order.
+After the threads join, the endpoints of all workers are merged and sorted, which gives global ids in byte order, the required output order. The output is then one task per hour: the row pointer of every worker for that hour is resolved once, each bucket of the hour gathers its blocks (one 32-byte AVX2 move per block, into a buffer that only grows), p50/p95/p99 are taken by sorting buckets of at most 64 values and by three `nth_element` calls on larger ones, and the line is formatted with a two-digit table. A finished hour is written as soon as every earlier hour has been written, so the file comes out in order without an extra pass.
 
 ## Dependencies
 
-None.
+None. The binary is built with `-march=x86-64-v3`, which the grading CPU supports (AVX2, BMI2, but no AVX-512).
 
 ## What did not work
 
-Writing the output with parallel `pwrite`, fusing the two count arrays, prefetch batching of the table lookups and a parallel prefix pass all measured no better on the test laptop and were dropped; the numbers are in [PERF.md](PERF.md) and the commit history.
+`MAP_POPULATE` (one thread faults in the whole file before the workers start), per-thread `MADV_POPULATE_READ`, disabling transparent huge pages, parallel `pwrite` of the output, fusing the per-endpoint count arrays, prefetch batching of the table lookups and a parallel prefix pass. Each was measured and dropped; the numbers are in [PERF.md](PERF.md) and the commit history.
 
 ## With another 24 hours
 
-Drop the 8-byte record array and the global scatter by writing each latency straight into its bucket. Timestamps in the log drift up to about 70 minutes from the byte order, so one thread cannot own an hour and the threads would have to hand records to each other. Measure on the grading hardware: the laptop's cache sizes and huge-page behaviour differ enough that several local speed-ups did not show up on the board.
+Cut peak memory. About 10 MB of the 39 MB is the text of the hours that are still waiting to be written (an hour's buffer is allocated when the hour starts, and hours finish out of order), and about 14 MB is the latency blocks. Streaming the formatted lines to the file as soon as their turn comes would remove the first; dropping the blocks needs a second pass over the input with the exact percentiles known, which trades time for memory at 50/20 weights. Also worth measuring on the grading hardware: the scan is as much memory-stall bound as instruction bound, so a smaller per-thread footprint may be worth more there than it is on this laptop.
