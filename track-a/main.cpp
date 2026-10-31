@@ -41,6 +41,8 @@ int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
 
 inline int dig2(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
 
+inline uint64_t load8(const char* p) { uint64_t w; memcpy(&w, p, 8); return w; }
+
 // Open-addressing table: endpoint bytes -> small id. The bytes stay in the mmap.
 //
 // Two levels, because the endpoint of a line is a Zipf draw: a 256-entry cache in front holds the
@@ -73,8 +75,9 @@ struct EpTable {
             p += 8;
             n -= 8;
         }
-        uint64_t w = 0;
-        memcpy(&w, p, n);
+        // The endpoint is followed by a space, so eight bytes can be read past it and masked: no
+        // memcpy call for the tail.
+        const uint64_t w = load8(p) & (n == 8 ? ~0ull : ((uint64_t(1) << (n * 8)) - 1));
         h = (h ^ w) * 0xc4ceb9fe1a85ec53ull;
         return (h ^ (h >> 29)) | 1;
     }
@@ -272,12 +275,33 @@ void scan(const char* b, const char* e, int64_t base_hour, Worker& w) {
     }
 }
 
+// Writes v in decimal to o and returns the end of what it wrote. Two digits per division through a
+// table of the 100 pairs, into a 32-byte scratch, then one fixed 16-byte copy: no per-digit
+// division loop and no variable-length memcpy call (which together were a fifth of the run).
 inline char* put_u64(char* o, uint64_t v) {
-    char tmp[20];
-    int n = 0;
-    do { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v);
-    while (n) *o++ = tmp[--n];
-    return o;
+    static const char kPairs[201] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    char tmp[32];
+    char* p = tmp + sizeof tmp;
+    while (v >= 100) {
+        const unsigned r = static_cast<unsigned>(v % 100);
+        v /= 100;
+        p -= 2;
+        p[0] = kPairs[2 * r];
+        p[1] = kPairs[2 * r + 1];
+    }
+    if (v >= 10) {
+        p -= 2;
+        p[0] = kPairs[2 * v];
+        p[1] = kPairs[2 * v + 1];
+    } else {
+        *--p = static_cast<char>('0' + v);
+    }
+    uint64_t a, b;
+    memcpy(&a, p, 8);
+    memcpy(&b, p + 8, 8);
+    memcpy(o, &a, 8);
+    memcpy(o + 8, &b, 8);
+    return o + static_cast<size_t>(tmp + sizeof tmp - p);
 }
 
 int thread_count() {
@@ -373,36 +397,80 @@ int main(int argc, char** argv) {
     int next_write = 0;
     std::atomic<int> next_hour{0};
     parallel(nt, [&](int) {
-        std::vector<uint32_t> vals;
+        // Grown, never shrunk: resize() would zero-fill the new elements of every group, and the copy
+        // below overwrites them anyway. Sixteen values of slack let a block be copied with one 32-byte
+        // move instead of a memcpy of its live values.
+        std::vector<uint32_t> vals(1024);
+        std::vector<const Cell*> row_of(nt, nullptr);  // each worker's row for this hour
+        std::vector<uint32_t> row_len(nt, 0);
         char line[256];
         for (int h; (h = next_hour.fetch_add(1)) < kHours;) {
             std::string& o = hour_out[static_cast<size_t>(h)];
             o.reserve(E * 80);
+            // The row of every worker for this hour changes once per hour, not once per endpoint:
+            // resolve the row pointers here so the group loop below only indexes an array.
+            for (int i = 0; i < nt; ++i) {
+                const int s = workers[i].slot_of[h];
+                if (s < 0) { row_of[i] = nullptr; row_len[i] = 0; }
+                else { row_of[i] = workers[i].rows[static_cast<size_t>(s)].data(); row_len[i] = static_cast<uint32_t>(workers[i].rows[static_cast<size_t>(s)].size()); }
+            }
             for (size_t e = 0; e < E; ++e) {
                 size_t n = 0;
                 uint64_t errs = 0;
-                for (int i = 0; i < nt; ++i)
-                    if (const Cell* c = workers[i].cell(static_cast<size_t>(h), local_of[i][e])) {
-                        n += c->count;
-                        errs += c->errs;
-                    }
-                if (!n) continue;
-                vals.resize(n);
-                size_t k = 0;
+                bool over = false;
                 for (int i = 0; i < nt; ++i) {
-                    const Cell* c = workers[i].cell(static_cast<size_t>(h), local_of[i][e]);
-                    if (!c || !c->count) continue;
-                    size_t left = c->count;
+                    const uint32_t lep = local_of[i][e];
+                    if (lep >= row_len[i]) continue;
+                    const Cell& c = row_of[i][lep];
+                    if (!c.count) continue;
+                    errs += c.errs;
+                    if (n + c.count > vals.size() - 8) { over = true; break; }
+                    size_t left = c.count;
+                    size_t k = n;
+                    n += left;
                     size_t take = (left - 1) % kBlockValues + 1;  // the newest block may be partly filled
-                    for (uint32_t id = c->tail; left;) {
+                    for (uint32_t id = c.tail; left;) {
                         const uint32_t* blk = workers[i].block(id);
-                        memcpy(&vals[k], blk, take * sizeof(uint32_t));
+                        // A block is 32 bytes and 32-byte aligned: copy all of it, keep `take` values.
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(&vals[k]),
+                                            _mm256_load_si256(reinterpret_cast<const __m256i*>(blk)));
                         k += take;
                         left -= take;
                         id = blk[kBlockValues];
                         take = kBlockValues;
                     }
                 }
+                if (over) {
+                    // Rare: a group larger than the buffer. Count first, then copy into an exact array.
+                    n = 0;
+                    errs = 0;
+                    for (int i = 0; i < nt; ++i) {
+                        const uint32_t lep = local_of[i][e];
+                        if (lep >= row_len[i]) continue;
+                        n += row_of[i][lep].count;
+                        errs += row_of[i][lep].errs;
+                    }
+                    if (vals.size() < n + 8) vals.resize(n + 8);
+                    size_t k = 0;
+                    for (int i = 0; i < nt; ++i) {
+                        const uint32_t lep = local_of[i][e];
+                        if (lep >= row_len[i]) continue;
+                        const Cell& c = row_of[i][lep];
+                        if (!c.count) continue;
+                        size_t left = c.count;
+                        size_t take = (left - 1) % kBlockValues + 1;
+                        for (uint32_t id = c.tail; left;) {
+                            const uint32_t* blk = workers[i].block(id);
+                            _mm256_storeu_si256(reinterpret_cast<__m256i*>(&vals[k]),
+                                                _mm256_load_si256(reinterpret_cast<const __m256i*>(blk)));
+                            k += take;
+                            left -= take;
+                            id = blk[kBlockValues];
+                            take = kBlockValues;
+                        }
+                    }
+                }
+                if (!n) continue;
                 uint32_t* v = vals.data();
                 const size_t r99 = (99 * n + 99) / 100, r95 = (95 * n + 99) / 100, r50 = (50 * n + 99) / 100;
                 if (n <= 64) {
