@@ -513,6 +513,15 @@ int main(int argc, char** argv) {
                 else { row_of[i] = workers[i].rows[static_cast<size_t>(s)].data(); row_len[i] = static_cast<uint32_t>(workers[i].rows[static_cast<size_t>(s)].size()); }
             }
             for (size_t e = 0; e < E; ++e) {
+                // The cells and the newest blocks of the endpoints a few places ahead are cache misses
+                // (12 workers' tables, each a different place), so they are prefetched now.
+                if (e + 6 < E)
+                    for (int i = 0; i < nt; ++i) {
+                        const uint32_t ahead = local_of[i][e + 6];
+                        if (ahead < row_len[i]) __builtin_prefetch(row_of[i] + ahead);
+                        const uint32_t near = local_of[i][e + 3];
+                        if (near < row_len[i] && row_of[i][near].count) __builtin_prefetch(workers[i].block(row_of[i][near].tail));
+                    }
                 size_t n = 0;
                 uint64_t errs = 0;
                 for (int i = 0; i < nt; ++i) {
