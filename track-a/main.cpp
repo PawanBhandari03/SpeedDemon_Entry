@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -56,6 +57,7 @@ struct EpTable {
     std::vector<Slot> slots = std::vector<Slot>(kCap);
     std::vector<Line> cache = std::vector<Line>(kCache);
     std::vector<std::string_view> names;
+    std::deque<std::string> store;  // the bytes of the names: the read buffer is reused
 
     static uint64_t hash(const char* p, size_t n) {
         // One multiply per eight bytes, with the avalanche left to the end: the extra shift-xor in
@@ -85,7 +87,8 @@ struct EpTable {
             if (!s.h) {
                 const uint32_t id = static_cast<uint32_t>(names.size());
                 s = {h, id, static_cast<uint32_t>(n)};
-                names.emplace_back(p, n);
+                store.emplace_back(p, n);
+                names.emplace_back(store.back());
                 c = {h, id, static_cast<uint32_t>(n)};
                 return static_cast<uint16_t>(id);
             }
@@ -308,6 +311,39 @@ void parallel(int n, F&& f) {
     for (auto& t : th) t.join();
 }
 
+// Scans the bytes [begin, end) of the file, which start and end on line boundaries, in blocks of
+// 128 KB read into a buffer that stays in the L2 cache. A block ends at its last LF, and the rest of
+// the line is moved to the front of the buffer for the next read. Mapping the whole file instead
+// costs a page fault and a TLB entry per 4 KB for data that is read exactly once.
+void scan_range(int fd, size_t begin, size_t end, Worker& w) {
+    constexpr size_t kBuf = size_t(1) << 17;
+    char* buf = static_cast<char*>(aligned_alloc(64, kBuf + 128));
+    size_t have = 0, pos = begin;
+    for (;;) {
+        const size_t want = std::min(kBuf - have, end - pos);
+        size_t got = 0;
+        while (got < want) {
+            const ssize_t r = pread(fd, buf + have + got, want - got, static_cast<off_t>(pos + got));
+            if (r <= 0) break;
+            got += static_cast<size_t>(r);
+        }
+        pos += got;
+        have += got;
+        const bool last = pos >= end || got < want;
+        size_t used = have;
+        if (!last) {
+            const void* nl = memrchr(buf, '\n', have);
+            used = nl ? static_cast<size_t>(static_cast<const char*>(nl) - buf) + 1 : 0;
+        }
+        memset(buf + have, 0, 64);
+        scan(buf, buf + used, w);
+        if (last) break;
+        memmove(buf, buf + used, have - used);
+        have -= used;
+    }
+    free(buf);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -326,21 +362,26 @@ int main(int argc, char** argv) {
     if (!f) return 1;
     if (size == 0) { fclose(f); return 0; }
 
-    const char* base = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-    if (base == MAP_FAILED) return 1;
-
     // One chunk per thread, cut just after a newline.
     const int nt = size < (1u << 20) ? 1 : thread_count();
-    std::vector<const char*> cut(nt + 1);
-    cut[0] = base;
-    cut[nt] = base + size;
+    std::vector<size_t> cut(nt + 1);
+    cut[0] = 0;
+    cut[nt] = size;
     for (int i = 1; i < nt; ++i) {
-        const char* p = base + size * i / nt;
-        const char* nl = static_cast<const char*>(memchr(p - 1, '\n', static_cast<size_t>(base + size - (p - 1))));
-        cut[i] = nl ? nl + 1 : base + size;
+        size_t at = size * i / nt - 1;
+        cut[i] = size;
+        for (char tmp[4096]; at < size;) {
+            const ssize_t r = pread(fd, tmp, sizeof tmp, static_cast<off_t>(at));
+            if (r <= 0) break;
+            if (const void* nl = memchr(tmp, '\n', static_cast<size_t>(r))) {
+                cut[i] = at + static_cast<size_t>(static_cast<const char*>(nl) - tmp) + 1;
+                break;
+            }
+            at += static_cast<size_t>(r);
+        }
     }
     std::vector<Worker> workers(nt);
-    parallel(nt, [&](int i) { scan(cut[i], std::max(cut[i], cut[i + 1]), workers[i]); });
+    parallel(nt, [&](int i) { scan_range(fd, cut[i], std::max(cut[i], cut[i + 1]), workers[i]); });
     for (auto& w : workers) if (w.bad) return 1;
 
     // Global endpoint ids, assigned in byte order, and for every worker the map from the global id
