@@ -22,6 +22,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 namespace {
@@ -250,6 +251,8 @@ void put_cents(std::string& out, int64_t c) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Huge pages would commit 2 MB for every sparsely touched page of the big arrays; ask for 4 KB pages.
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     std::string data = "/data", outdir = "/out";
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--data")) data = argv[i + 1];
